@@ -376,3 +376,200 @@ function Test-AppClosed([string]$Provider) {
     return $true
 }
 
+function Format-Bytes([long]$Bytes) {
+    if ($Bytes -lt 1024) { return "$Bytes B" }
+    foreach ($unit in @('KB', 'MB', 'GB', 'TB')) {
+        $Bytes = [math]::Round($Bytes / 1024, 1)
+        if ($Bytes -lt 1024 -or $unit -eq 'TB') { return "$Bytes $unit" }
+    }
+}
+
+function Write-InventoryText($Items) {
+    if (-not @($Items).Count) { Write-Output 'No matching items.'; return }
+    foreach ($group in ($Items | Group-Object Provider, Category | Sort-Object Name)) {
+        [long]$total = 0
+        foreach ($item in $group.Group) { $total += $item.Bytes }
+        Write-Output ("{0}: {1} items, {2} logical" -f $group.Name, $group.Count, (Format-Bytes $total))
+        foreach ($item in $group.Group) {
+            $flag = if ($item.Eligible) { 'selectable' } else { 'inspect' }
+            $title = if ($item.Title) { ' | ' + $item.Title } else { '' }
+            $partial = if ($item.Incomplete) { ' (incomplete)' } else { '' }
+            Write-Output ("  [{0}] {1}{2} | {3}{4}" -f $flag, (Format-Bytes $item.Bytes), $partial, $item.Path, $title)
+        }
+    }
+}
+
+function Get-ViewRows($Items, $State) {
+    switch ($State.Level) {
+        0 { return @($Items | Select-Object -ExpandProperty Provider -Unique | Sort-Object) }
+        1 { return @($Items | Where-Object Provider -eq $State.Provider | Select-Object -ExpandProperty Category -Unique | Sort-Object) }
+        2 { return @($Items | Where-Object { $_.Provider -eq $State.Provider -and $_.Category -eq $State.Category } | Sort-Object Path) }
+        default { return @() }
+    }
+}
+
+function Update-NavState($State, [string]$Key, $Rows) {
+    $count = @($Rows).Count
+    switch ($Key) {
+        'UpArrow' { if ($count) { $State.Index = ($State.Index + $count - 1) % $count } }
+        'DownArrow' { if ($count) { $State.Index = ($State.Index + 1) % $count } }
+        'Enter' {
+            if ($count -and $State.Level -lt 3) {
+                if ($State.Level -eq 0) { $State.Provider = [string]$Rows[$State.Index] }
+                if ($State.Level -eq 1) { $State.Category = [string]$Rows[$State.Index] }
+                $State.Level++; $State.Index = 0
+            }
+        }
+        'Backspace' { if ($State.Level -gt 0) { $State.Level--; $State.Index = 0 } }
+    }
+    return $State
+}
+
+function Get-SelectedItems($Items, $Selected) {
+    return @($Items | Where-Object { $Selected.ContainsKey($_.Key) })
+}
+
+function Get-FreeSpace($Items) {
+    $space = @{}
+    foreach ($item in $Items) {
+        try {
+            $root = [IO.Path]::GetPathRoot($item.Path)
+            if (-not $space.ContainsKey($root)) { $space[$root] = ([IO.DriveInfo]::new($root)).AvailableFreeSpace }
+        } catch { }
+    }
+    return $space
+}
+
+function Invoke-FileRemoval([string]$Path, [string]$Method) {
+    if ($Method -eq 'Recycle Bin') {
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $ui = [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs
+        $recycle = [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+        if (Test-Path -LiteralPath $Path -PathType Container) {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($Path, $ui, $recycle)
+        } else {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($Path, $ui, $recycle)
+        }
+    } else {
+        Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
+    }
+}
+
+function Invoke-CodexDeletion([string]$Id) {
+    $command = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { throw 'codex CLI unavailable' }
+    & $command.Source delete --force $Id
+    if ($LASTEXITCODE -ne 0) { throw "codex delete exited $LASTEXITCODE" }
+}
+
+function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
+    $selected = @($Items)
+    if (-not $selected.Count) { Write-Host 'Nothing selected.'; return }
+    $files = @($selected | Where-Object Kind -ne 'CodexSession')
+    $codex = @($selected | Where-Object Kind -eq 'CodexSession')
+    $before = Get-FreeSpace $selected
+    if ($files.Count) {
+        Write-Host "`nFile cleanup: $($files.Count) items"
+        $choice = (Read-Host 'Method: R = Recycle Bin, P = permanent, C = cancel').Trim().ToUpperInvariant()
+        if ($choice -in @('R', 'P')) {
+            $method = if ($choice -eq 'R') { 'Recycle Bin' } else { 'Permanent' }
+            [long]$bytes = 0
+            $preview = @{}
+            foreach ($item in $files) {
+                $bytes += $item.Bytes
+                $preview[$item.Key] = @(Get-ItemPaths $item)
+                foreach ($path in $preview[$item.Key]) { Write-Host ("  {0} | {1}" -f $method, $path) }
+            }
+            Write-Host ("{0} items, {1} estimated logical size." -f $files.Count, (Format-Bytes $bytes))
+            if ((Read-Host 'Type DELETE FILES to confirm') -ceq 'DELETE FILES') {
+                foreach ($item in $files) {
+                    if (-not (Test-AppClosed $item.Provider)) { Write-Host "SKIP $($item.Path): close $($item.Provider) first"; continue }
+                    $reason = Test-SafeItem $item $Context $Advanced
+                    if ($reason) { Write-Host "SKIP $($item.Path): $reason"; continue }
+                    $now = @(Get-ItemPaths $item)
+                    $was = @($preview[$item.Key])
+                    if (($now -join [char]0) -cne ($was -join [char]0)) { Write-Host "SKIP $($item.Path): paths changed after preview"; continue }
+                    foreach ($path in $was) {
+                        try {
+                            if (-not (Test-NoReparse $path $true)) { throw 'Reparse point or unreadable path' }
+                            Invoke-FileRemoval $path $method
+                            Write-Host "OK $method $path"
+                        } catch { Write-Host "FAIL $path`: $($_.Exception.Message)" }
+                    }
+                }
+            } else { Write-Host 'File cleanup cancelled.' }
+        } else { Write-Host 'File cleanup cancelled.' }
+    }
+    if ($codex.Count) {
+        Write-Host "`nCodex sessions: $($codex.Count) permanent deletions via codex delete"
+        [long]$bytes = 0
+        foreach ($item in $codex) { $bytes += $item.Bytes; Write-Host ("  codex delete {0} | {1}" -f $item.Id, $item.Path) }
+        Write-Host ("{0} items, {1} estimated logical size." -f $codex.Count, (Format-Bytes $bytes))
+        if ((Read-Host 'Type DELETE CODEX to confirm') -ceq 'DELETE CODEX') {
+            foreach ($item in $codex) {
+                if (-not (Test-AppClosed 'Codex')) { Write-Host "SKIP $($item.Id): close Codex first"; continue }
+                $reason = Test-SafeItem $item $Context $Advanced
+                if ($reason) { Write-Host "SKIP $($item.Id): $reason"; continue }
+                try {
+                    Invoke-CodexDeletion $item.Id
+                    Write-Host "OK codex delete $($item.Id)"
+                } catch { Write-Host "FAIL codex delete $($item.Id): $($_.Exception.Message)" }
+            }
+        } else { Write-Host 'Codex cleanup cancelled.' }
+    }
+    $after = Get-FreeSpace $selected
+    foreach ($root in $before.Keys) {
+        if ($after.ContainsKey($root)) { Write-Host ("Free space {0}: {1} -> {2}" -f $root, (Format-Bytes $before[$root]), (Format-Bytes $after[$root])) }
+    }
+}
+
+function Invoke-InventoryUI($Items, $Context, [bool]$Advanced = $false) {
+    if ([Console]::IsInputRedirected) { Write-InventoryText $Items; return }
+    $state = [pscustomobject]@{ Level = 0; Provider = ''; Category = ''; Index = 0; DetailKey = '' }
+    $selected = @{}
+    while ($true) {
+        $rows = @(Get-ViewRows $Items $state)
+        if ($state.Index -ge $rows.Count) { $state.Index = [math]::Max(0, $rows.Count - 1) }
+        Clear-Host
+        Write-Host ('Agent Purge | {0} selected | Esc quit | D cleanup' -f $selected.Count)
+        Write-Host 'Arrows navigate | Enter open | Space select | Backspace back | C copy resume'
+        Write-Host ("{0} {1}" -f $state.Provider, $state.Category)
+        if ($state.Level -eq 3) {
+            $item = $Items | Where-Object { $_.Key -eq $state.DetailKey } | Select-Object -First 1
+            if ($item) {
+                foreach ($field in @('Provider', 'Project', 'Category', 'Date', 'Title', 'TitleSource', 'Path', 'Resume', 'Reason')) {
+                    if ($item.$field) { Write-Host ("{0}: {1}" -f $field, $item.$field) }
+                }
+                Write-Host ('Size: {0}{1}' -f (Format-Bytes $item.Bytes), $(if ($item.Incomplete) { ' (incomplete)' } else { '' }))
+                Write-Host ('Selectable: ' + $item.Eligible)
+            }
+        } elseif (-not $rows.Count) { Write-Host 'No items.' }
+        else {
+            $limit = [math]::Min($rows.Count, [math]::Max(8, [Console]::WindowHeight - 7))
+            $start = [math]::Max(0, $state.Index - $limit + 1)
+            for ($i = $start; $i -lt [math]::Min($rows.Count, $start + $limit); $i++) {
+                $mark = if ($i -eq $state.Index) { '>' } else { ' ' }
+                if ($state.Level -eq 2) {
+                    $item = $rows[$i]
+                    $check = if ($selected.ContainsKey($item.Key)) { '[x]' } elseif ($item.Eligible) { '[ ]' } else { '[-]' }
+                    Write-Host ("{0} {1} {2} {3} {4}" -f $mark, $check, (Format-Bytes $item.Bytes), (Split-Path -Leaf $item.Path), $item.Title)
+                } else { Write-Host ("{0} {1}" -f $mark, $rows[$i]) }
+            }
+        }
+        $key = [Console]::ReadKey($true).Key.ToString()
+        if ($key -eq 'Escape') { return }
+        if ($key -eq 'D') { Invoke-Cleanup (Get-SelectedItems $Items $selected) $Context $Advanced; [void][Console]::ReadKey($true); continue }
+        if ($key -eq 'Spacebar' -and $state.Level -ge 2) {
+            $item = if ($state.Level -eq 3) { $Items | Where-Object Key -eq $state.DetailKey | Select-Object -First 1 } elseif ($rows.Count) { $rows[$state.Index] }
+            if ($item -and $item.Eligible) { if ($selected.ContainsKey($item.Key)) { $selected.Remove($item.Key) } else { $selected[$item.Key] = $true } }
+            continue
+        }
+        if ($key -eq 'C' -and $state.Level -eq 3 -and $item.Resume) {
+            try { Set-Clipboard -Value $item.Resume -ErrorAction Stop } catch { Write-Host "Clipboard unavailable: $($item.Resume)"; [void][Console]::ReadKey($true) }
+            continue
+        }
+        if ($key -eq 'Enter' -and $state.Level -eq 2 -and $rows.Count) { $state.DetailKey = $rows[$state.Index].Key; $state.Level = 3; continue }
+        $state = Update-NavState $state $key $rows
+    }
+}
+
