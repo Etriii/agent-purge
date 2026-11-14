@@ -192,3 +192,187 @@ function Get-SessionInventory($Context, [string]$ProjectPath = '') {
     return $items.ToArray()
 }
 
+function Get-CurrentClaudeVersion($Context) {
+    if ($Context.PSObject.Properties['CurrentClaudeVersion'] -and $Context.CurrentClaudeVersion) { return $Context.CurrentClaudeVersion }
+    if (-not (Test-Path -LiteralPath $Context.ClaudeBinary)) { return '' }
+    try {
+        $output = & $Context.ClaudeBinary --version 2>$null | Select-Object -First 1
+        if ($output -match '^([0-9]+\.[0-9]+\.[0-9]+)') { return $Matches[1] }
+    } catch { }
+    return ''
+}
+
+function Get-CurrentCodexTarget($Context, [string]$Package) {
+    $link = Join-Path (Join-Path $Context.CodexPackages $Package) 'current'
+    try {
+        $item = Get-Item -LiteralPath $link -Force -ErrorAction Stop
+        if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or -not $item.Target) { return '' }
+        return Get-FullPath ([string]$item.Target[0])
+    } catch { return '' }
+}
+
+function Test-CodexRuntimeActive($Context, [string]$Package, [string]$Path) {
+    $current = Get-CurrentCodexTarget $Context $Package
+    if (-not $current -or $current -eq (Get-FullPath $Path)) { return $true }
+    $versionFile = Join-Path (Join-Path $Context.CodexPackages $Package) 'auto-update-version'
+    if (-not (Test-Path -LiteralPath $versionFile)) { return $true }
+    try { $version = (Get-Content -LiteralPath $versionFile -TotalCount 1 -ErrorAction Stop).Trim() } catch { return $true }
+    return (Split-Path -Leaf $Path) -eq $version
+}
+
+function Get-GlobalInventory($Context, [bool]$Advanced = $false) {
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in (Get-SessionInventory $Context)) { $items.Add($item) }
+    foreach ($spec in @(
+        @('Codex', (Join-Path $Context.CodexRoot 'cache')),
+        @('Claude', (Join-Path $Context.ClaudeRoot 'cache'))
+    )) {
+        $provider = $spec[0]; $root = $spec[1]
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($child in (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+            $items.Add((New-InventoryItem $Context $provider 'Caches' 'Cache' $child.FullName '' '' '' '' '' '' $Advanced $(if ($Advanced) { '' } else { 'Requires --advanced' })))
+        }
+    }
+    $debug = Join-Path $Context.ClaudeRoot 'debug'
+    if (Test-Path -LiteralPath $debug) {
+        foreach ($f in (Get-ChildItem -LiteralPath $debug -File -Filter '*.txt' -ErrorAction SilentlyContinue)) {
+            $items.Add((New-InventoryItem $Context 'Claude' 'Logs' 'Log' $f.FullName '' '' '' '' '' '' $true))
+        }
+    }
+    $daemonLog = Join-Path $Context.ClaudeRoot 'daemon.log'
+    if (Test-Path -LiteralPath $daemonLog) { $items.Add((New-InventoryItem $Context 'Claude' 'Logs' 'Log' $daemonLog '' '' '' '' '' '' $true)) }
+    if (Test-Path -LiteralPath $Context.CodexRoot) {
+        foreach ($f in (Get-ChildItem -LiteralPath $Context.CodexRoot -File -Force -ErrorAction SilentlyContinue)) {
+            if ($f.Name -match '^sandbox\..+\.log$') { $items.Add((New-InventoryItem $Context 'Codex' 'Logs' 'Log' $f.FullName '' '' '' '' '' '' $true)) }
+            elseif ($f.Name -match '^logs_\d+\.sqlite(?:-shm|-wal)?$') { $items.Add((New-InventoryItem $Context 'Codex' 'Logs' 'Inspection' $f.FullName '' '' '' '' '' '' $false 'Provider database; inspection only')) }
+        }
+    }
+    $claudeVersion = Get-CurrentClaudeVersion $Context
+    if (Test-Path -LiteralPath $Context.ClaudeVersions) {
+        foreach ($f in (Get-ChildItem -LiteralPath $Context.ClaudeVersions -File -ErrorAction SilentlyContinue)) {
+            $old = $claudeVersion -and $f.Name -match '^\d+\.\d+\.\d+$' -and $f.Name -ne $claudeVersion
+            $items.Add((New-InventoryItem $Context 'Claude' 'Runtimes' 'ClaudeRuntime' $f.FullName '' '' '' '' '' '' ([bool]($Advanced -and $old)) $(if (-not $old) { 'Current or unverified version' } elseif (-not $Advanced) { 'Requires --advanced' } else { '' })))
+        }
+    }
+    foreach ($package in @('standalone', 'app-server-daemon')) {
+        $releaseRoot = Join-Path (Join-Path $Context.CodexPackages $package) 'releases'
+        if (-not (Test-Path -LiteralPath $releaseRoot)) { continue }
+        foreach ($dir in (Get-ChildItem -LiteralPath $releaseRoot -Directory -ErrorAction SilentlyContinue)) {
+            $old = $dir.Name -match '^\d+\.\d+\.\d+-x86_64-pc-windows-msvc$' -and -not (Test-CodexRuntimeActive $Context $package $dir.FullName)
+            $items.Add((New-InventoryItem $Context 'Codex' 'Runtimes' 'CodexRuntime' $dir.FullName '' '' '' '' '' '' ([bool]($Advanced -and $old)) $(if (-not $old) { 'Current or unverified version' } elseif (-not $Advanced) { 'Requires --advanced' } else { '' })))
+        }
+    }
+    foreach ($spec in @(@('Codex', $Context.CodexRoot), @('Claude', $Context.ClaudeRoot))) {
+        $provider = $spec[0]; $root = $spec[1]
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        foreach ($child in (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+            $skip = if ($provider -eq 'Codex') { @('sessions', 'cache', 'packages') } else { @('projects', 'cache', 'debug', 'daemon.log') }
+            if ($child.Name -in $skip -or ($provider -eq 'Codex' -and $child.Name -match '^(sandbox\..+\.log|logs_\d+\.sqlite(?:-shm|-wal)?)$')) { continue }
+            $items.Add((New-InventoryItem $Context $provider 'Protected / other' 'Inspection' $child.FullName '' '' '' '' '' '' $false 'Inspection only'))
+        }
+    }
+    foreach ($spec in @(@('Codex', $Context.CodexBinary), @('Claude', $Context.ClaudeBinary))) {
+        if (Test-Path -LiteralPath $spec[1]) { $items.Add((New-InventoryItem $Context $spec[0] 'Current binaries' 'Inspection' $spec[1] '' '' '' '' '' '' $false 'Inspection only')) }
+    }
+    return $items.ToArray()
+}
+
+function Get-ItemPaths($Item) {
+    $paths = @($Item.Path)
+    if ($Item.Kind -eq 'ClaudeSession') {
+        $sidecar = Join-Path (Split-Path -Parent $Item.Path) $Item.Id
+        if (Test-Path -LiteralPath $sidecar) { $paths += $sidecar }
+    }
+    return $paths
+}
+
+function Test-NoReparse([string]$Path, [bool]$Deep = $false) {
+    $full = Get-FullPath $Path
+    $root = [IO.Path]::GetPathRoot($full)
+    $relative = $full.Substring($root.Length)
+    $cursor = $root
+    foreach ($part in ($relative -split '[\\/]')) {
+        if (-not $part) { continue }
+        $cursor = Join-Path $cursor $part
+        try { $entry = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop } catch { return $false }
+        if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    }
+    if ($Deep) {
+        $pending = New-Object 'System.Collections.Generic.Stack[string]'
+        $pending.Push($full)
+        while ($pending.Count -gt 0) {
+            $next = $pending.Pop()
+            try {
+                $entry = Get-Item -LiteralPath $next -Force -ErrorAction Stop
+                if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+                if ($entry.PSIsContainer) { foreach ($child in (Get-ChildItem -LiteralPath $next -Force -ErrorAction Stop)) { $pending.Push($child.FullName) } }
+            } catch { return $false }
+        }
+    }
+    return $true
+}
+
+function Test-SafeItem($Item, $Context, [bool]$Advanced = $false) {
+    if (-not $Item.Eligible) { return 'Item is inspection only' }
+    $path = Get-FullPath $Item.Path
+    if (-not (Test-Path -LiteralPath $path)) { return 'Path no longer exists' }
+    $parent = Split-Path -Parent $path
+    switch ($Item.Kind) {
+        'CodexSession' {
+            if ((Get-Item -LiteralPath $path).PSIsContainer) { return 'Session is not a file' }
+            $root = Join-Path $Context.CodexRoot 'sessions'
+            if (-not (Test-Within $path $root) -or $Item.Id -notmatch '^[0-9a-fA-F-]{36}$' -or $path -notmatch ('rollout-.*-' + [regex]::Escape($Item.Id) + '\.jsonl$')) { return 'Unrecognized Codex session path' }
+            $head = Get-SessionHead $path 'Codex'
+            if ($head.Id -ne $Item.Id -or $head.Cwd -ne $Item.Project) { return 'Session metadata changed' }
+        }
+        'ClaudeSession' {
+            if ((Get-Item -LiteralPath $path).PSIsContainer) { return 'Session is not a file' }
+            $root = Join-Path $Context.ClaudeRoot 'projects'
+            if (-not (Test-Within $parent $root) -or (Split-Path -Parent $parent) -ne $root -or $Item.Id -notmatch '^[0-9a-fA-F-]{36}$' -or (Split-Path -Leaf $path) -ne ($Item.Id + '.jsonl')) { return 'Unrecognized Claude session path' }
+            $head = Get-SessionHead $path 'Claude'
+            if ($head.Id -ne $Item.Id -or $head.Cwd -ne $Item.Project) { return 'Session metadata changed' }
+            $sidecar = Join-Path $parent $Item.Id
+            if ((Test-Path -LiteralPath $sidecar) -and -not (Test-Path -LiteralPath $sidecar -PathType Container)) { return 'Unrecognized session sidecar' }
+        }
+        'Log' {
+            if ((Get-Item -LiteralPath $path).PSIsContainer) { return 'Log is not a file' }
+            $debug = Join-Path $Context.ClaudeRoot 'debug'
+            $claudeLog = $Item.Provider -eq 'Claude' -and (($parent -eq $debug -and $path -match '\.txt$') -or $path -eq (Join-Path $Context.ClaudeRoot 'daemon.log'))
+            $codexLog = $Item.Provider -eq 'Codex' -and $parent -eq $Context.CodexRoot -and (Split-Path -Leaf $path) -match '^sandbox\..+\.log$'
+            if (-not ($claudeLog -or $codexLog)) { return 'Unrecognized log path' }
+        }
+        'Cache' {
+            if (-not $Advanced) { return 'Advanced mode required' }
+            $roots = @((Join-Path $Context.CodexRoot 'cache'), (Join-Path $Context.ClaudeRoot 'cache'))
+            if ($parent -notin $roots) { return 'Unrecognized cache path' }
+        }
+        'CodexRuntime' {
+            if (-not (Get-Item -LiteralPath $path).PSIsContainer) { return 'Runtime is not a directory' }
+            if (-not $Advanced) { return 'Advanced mode required' }
+            $package = Split-Path -Leaf (Split-Path -Parent $parent)
+            $expected = Join-Path (Join-Path $Context.CodexPackages $package) 'releases'
+            if ($package -notin @('standalone', 'app-server-daemon') -or $parent -ne $expected -or (Split-Path -Leaf $path) -notmatch '^\d+\.\d+\.\d+-x86_64-pc-windows-msvc$') { return 'Unrecognized runtime path' }
+            if (Test-CodexRuntimeActive $Context $package $path) { return 'Current or unverified runtime' }
+        }
+        'ClaudeRuntime' {
+            if ((Get-Item -LiteralPath $path).PSIsContainer) { return 'Runtime is not a file' }
+            if (-not $Advanced) { return 'Advanced mode required' }
+            $current = Get-CurrentClaudeVersion $Context
+            if ($parent -ne $Context.ClaudeVersions -or (Split-Path -Leaf $path) -notmatch '^\d+\.\d+\.\d+$' -or -not $current -or (Split-Path -Leaf $path) -eq $current) { return 'Current or unverified runtime' }
+        }
+        default { return 'Protected or unknown item' }
+    }
+    foreach ($part in (Get-ItemPaths $Item)) {
+        if (-not (Test-NoReparse $part $true)) { return 'Reparse point or unreadable path' }
+    }
+    return ''
+}
+
+function Test-AppClosed([string]$Provider) {
+    $names = if ($Provider -eq 'Codex') { @('codex', 'codex-code-mode-host') } else { @('claude', 'Claude Desktop') }
+    foreach ($process in (Get-Process -ErrorAction SilentlyContinue)) {
+        if ($process.ProcessName -in $names) { return $false }
+    }
+    return $true
+}
+
