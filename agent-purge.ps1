@@ -573,3 +573,103 @@ function Invoke-InventoryUI($Items, $Context, [bool]$Advanced = $false) {
     }
 }
 
+function Install-AgentPurge {
+    param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
+        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
+    $root = Get-FullPath $InstallRoot
+    $scriptFile = Join-Path $root 'agent-purge.ps1'
+    $launcher = Join-Path $root 'agent-purge.cmd'
+    $marker = Join-Path $root 'install.json'
+    if ((Test-Path -LiteralPath $root) -and -not (Test-Path -LiteralPath $marker)) { throw "Install directory already exists without an agent-purge marker: $root" }
+    if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+    if ((Get-FullPath $script:AgentPurgeScript) -ne $scriptFile) { Copy-Item -LiteralPath $script:AgentPurgeScript -Destination $scriptFile -Force }
+    $body = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0agent-purge.ps1`" %*`r`n"
+    [IO.File]::WriteAllText($launcher, $body, [Text.Encoding]::ASCII)
+    $record = [ordered]@{ name = 'agent-purge'; scriptHash = (Get-FileHash -LiteralPath $scriptFile -Algorithm SHA256).Hash; launcherHash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash }
+    [IO.File]::WriteAllText($marker, ($record | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
+    $pathValue = [Environment]::GetEnvironmentVariable('Path', $PathScope)
+    $segments = @($pathValue -split ';' | Where-Object { $_ })
+    if (-not @($segments | Where-Object { $_.TrimEnd('\') -eq $root }).Count) {
+        [Environment]::SetEnvironmentVariable('Path', (($segments + $root) -join ';'), $PathScope)
+    }
+    Write-Host "Installed at $root"
+    if ($PathScope -eq 'User') { Write-Host 'Open a new terminal to use agent-purge.' }
+}
+
+function Uninstall-AgentPurge {
+    param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
+        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
+    $root = Get-FullPath $InstallRoot
+    $scriptFile = Join-Path $root 'agent-purge.ps1'
+    $launcher = Join-Path $root 'agent-purge.cmd'
+    $marker = Join-Path $root 'install.json'
+    if (-not (Test-Path -LiteralPath $marker)) { throw "No agent-purge installation marker at $root" }
+    $record = Get-Content -LiteralPath $marker -Raw | ConvertFrom-Json
+    if ($record.name -ne 'agent-purge') { throw 'Installation marker is invalid' }
+    foreach ($pair in @(@($scriptFile, $record.scriptHash), @($launcher, $record.launcherHash))) {
+        if ((Test-Path -LiteralPath $pair[0]) -and (Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne $pair[1]) { throw "Installed file was modified; leaving installation intact: $($pair[0])" }
+    }
+    foreach ($file in @($scriptFile, $launcher, $marker)) { if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file -Force } }
+    if (-not (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $root }
+    $pathValue = [Environment]::GetEnvironmentVariable('Path', $PathScope)
+    $segments = @($pathValue -split ';' | Where-Object { $_ -and $_.TrimEnd('\') -ne $root })
+    [Environment]::SetEnvironmentVariable('Path', ($segments -join ';'), $PathScope)
+    Write-Host "Uninstalled from $root"
+}
+
+function Show-AgentPurgeHelp {
+    @'
+Agent Purge: inspect and selectively clean local Codex and Claude storage.
+
+Usage:
+  agent-purge                       Interactive global/project scope picker
+  agent-purge scan --global         Inspect global provider storage
+  agent-purge scan --global --advanced
+                                    Also allow verified old runtimes and caches
+  agent-purge scan --project <path> Inspect sessions in a project and descendants
+  agent-purge install               Install a user-local launcher and PATH entry
+  agent-purge uninstall             Remove installed files and that PATH entry
+  agent-purge --help                Show this help
+
+Keys: Up/Down navigate, Enter open, Space select, Backspace back, C copy resume
+command from detail, D review cleanup, Esc quit. Protected items show [-].
+Redirected scans print an inventory and cannot remove anything.
+'@ | Write-Output
+}
+
+function Invoke-AgentPurge([string[]]$Arguments) {
+    if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core' -and $env:OS -ne 'Windows_NT') { throw 'Agent Purge requires Windows.' }
+    if (-not $Arguments.Count) {
+        if ([Console]::IsInputRedirected) { Show-AgentPurgeHelp; return }
+        Write-Host 'Agent Purge: G global scan, P project scan, Esc quit'
+        $key = [Console]::ReadKey($true).Key.ToString()
+        if ($key -eq 'Escape') { return }
+        if ($key -eq 'G') { $Arguments = @('scan', '--global') }
+        elseif ($key -eq 'P') { $Arguments = @('scan', '--project', (Read-Host 'Project path')) }
+        else { return }
+    }
+    if ($Arguments.Count -eq 1 -and $Arguments[0] -eq '--help') { Show-AgentPurgeHelp; return }
+    if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
+    if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
+    if ($Arguments[0] -ne 'scan') { throw 'Unknown command. Use --help.' }
+    $context = New-AgentPurgeContext
+    if ($Arguments.Count -eq 2 -and $Arguments[1] -eq '--global') {
+        Invoke-InventoryUI (Get-GlobalInventory $context $false) $context $false
+        return
+    }
+    if ($Arguments.Count -eq 3 -and $Arguments[1] -eq '--global' -and $Arguments[2] -eq '--advanced') {
+        Invoke-InventoryUI (Get-GlobalInventory $context $true) $context $true
+        return
+    }
+    if ($Arguments.Count -eq 3 -and $Arguments[1] -eq '--project') {
+        if (-not (Test-Path -LiteralPath $Arguments[2] -PathType Container)) { throw "Project directory not found: $($Arguments[2])" }
+        $project = (Get-Item -LiteralPath $Arguments[2]).FullName
+        Invoke-InventoryUI (Get-SessionInventory $context $project) $context $false
+        return
+    }
+    throw 'Invalid arguments. Use --help.'
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    try { Invoke-AgentPurge $args } catch { Write-Error $_.Exception.Message; exit 1 }
+}
