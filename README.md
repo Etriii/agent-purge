@@ -2,7 +2,39 @@
 
 Agent Purge is a Windows PowerShell 5.1 CLI for inspecting local Codex and Claude storage and selectively removing recognized items. Scans do not change provider data. It has no required dependencies; Python is optional for reading Codex session titles from SQLite.
 
-## Run and install
+## Install from GitHub
+
+With Git for Windows installed, clone the repository and install from the checkout:
+
+```powershell
+git clone https://github.com/Etriii/agent-purge.git
+Set-Location .\agent-purge
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 install
+```
+
+Open a new terminal, then run `agent-purge --help`. A private repository requires GitHub access configured for Git on this machine.
+
+To update, pull the latest `main` branch in the same checkout and run `install` again:
+
+```powershell
+Set-Location path\to\agent-purge
+git pull --ff-only origin main
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 install
+```
+
+`install` replaces the installed script and launcher and does not add a duplicate PATH entry. If `git pull` fails, stop and resolve that before running `install`.
+
+For a public repository, Git is optional. Download the script from the `main` branch with PowerShell, then run `install`; repeat these commands to update:
+
+```powershell
+$download = Join-Path $env:TEMP 'agent-purge.ps1'
+Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/Etriii/agent-purge/main/agent-purge.ps1' -OutFile $download -ErrorAction Stop
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File $download install
+```
+
+The GitHub commands require this repository to contain the `main` branch.
+
+## Local install and uninstall
 
 From this directory:
 
@@ -19,9 +51,7 @@ To remove the installed script, launcher, marker, and only its PATH entry:
 agent-purge uninstall
 ```
 
-Uninstall preserves other files in the install directory and refuses to remove an installed script or launcher that was modified after installation.
-
-When a GitHub release is published, download `agent-purge.ps1` from that release into a local directory, review it, and run the same `install` command from that directory. No release URL is available yet.
+Uninstall preserves other files in the install directory and refuses to remove an installed script or launcher that was modified after installation. It leaves the Git checkout or downloaded source file in place; those can be removed separately if no longer needed.
 
 ## Commands
 

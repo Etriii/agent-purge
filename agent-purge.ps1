@@ -634,6 +634,7 @@ Usage:
 Keys: Up/Down navigate, Enter open, Space select, Backspace back, C copy resume
 command from detail, D review cleanup, Esc quit. Protected items show [-].
 Redirected scans print an inventory and cannot remove anything.
+To update: pull the latest main branch in your Git checkout and run install again.
 '@ | Write-Output
 }
 

@@ -144,14 +144,22 @@ c.close()
     Assert ($script:deletedIds.Count -eq 1 -and $script:deletedIds[0] -eq $cid) 'Separate Codex confirmation'
     $installRoot = Join-Path $fixture 'install'
     $oldPath = [Environment]::GetEnvironmentVariable('Path', 'Process')
+    $originalSource = $script:AgentPurgeScript
     try {
         Install-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
         Assert ((Test-Path (Join-Path $installRoot 'agent-purge.cmd')) -and ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot))) 'Install files/PATH'
+        $updatedSource = Join-Path $fixture 'updated-agent-purge.ps1'
+        Set-Content -LiteralPath $updatedSource -Value '# update fixture'
+        $script:AgentPurgeScript = $updatedSource
+        Install-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
+        Assert ((Get-Content -LiteralPath (Join-Path $installRoot 'agent-purge.ps1') -Raw) -match 'update fixture') 'Update replaces installed script'
+        $pathEntries = @([Environment]::GetEnvironmentVariable('Path', 'Process') -split ';' | Where-Object { $_ -eq $installRoot })
+        Assert ($pathEntries.Count -eq 1) 'Update keeps one PATH entry'
         Uninstall-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
         Assert (-not (Test-Path $installRoot)) 'Uninstall files'
         Assert (-not ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot))) 'Uninstall PATH'
-    } finally { [Environment]::SetEnvironmentVariable('Path', $oldPath, 'Process') }
-    Write-Host 'PASS: fixtures, navigation, safety, both file methods, install/uninstall.'
+    } finally { $script:AgentPurgeScript = $originalSource; [Environment]::SetEnvironmentVariable('Path', $oldPath, 'Process') }
+    Write-Host 'PASS: fixtures, navigation, safety, both file methods, install/update/uninstall.'
 } finally {
     $full = Get-FullPath $fixture
     $tempRoot = Get-FullPath $env:TEMP
