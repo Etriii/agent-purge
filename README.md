@@ -61,7 +61,7 @@ To remove the installed script, launcher, marker, and only its PATH entry:
 agent-purge uninstall
 ```
 
-Uninstall preserves other files in the install directory and refuses to remove an installed script or launcher that was modified after installation. It leaves the Git checkout or downloaded source file in place; those can be removed separately if no longer needed.
+Uninstall preserves other files in the install directory and refuses to remove an installed script or launcher that was modified after installation. It leaves the Git checkout or downloaded source file and any Agent Purge undo folders in place; those can be removed separately when no longer needed.
 
 ## Commands
 
@@ -78,6 +78,7 @@ Uninstall preserves other files in the install directory and refuses to remove a
 | `agent-purge install` | Install the user-local launcher and PATH entry. |
 | `agent-purge update` | Update the installed command from published `main`. |
 | `agent-purge uninstall` | Remove the installed files and PATH entry. |
+| `agent-purge restore <run-id> <hash>` | Restore files saved by one undo-folder cleanup run. |
 | `agent-purge --help` | Print command and key help. |
 
 Both `scan` and `clean` require an interactive terminal to select or remove items. Redirected input always prints a **read-only** inventory, even with `clean --all`; there is no unattended deletion option. The global scan may take time because it measures logical file sizes. Inaccessible entries are marked **incomplete**, and affected totals are lower bounds.
@@ -131,7 +132,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 clean
 
 Recognized Claude session transcripts and matching session sidecar directories, plus known Claude logs, are selectable in normal mode. Advanced mode adds direct entries under known provider cache directories and runtime versions verified against current runtime targets. Credentials, settings, skills, plugins, worktrees, current binaries, active runtimes, and unknown paths are inspection only. A Claude session's project `memory` directory and global `history.jsonl` are never selected with its transcript; Claude may still show history references after transcript removal.
 
-For eligible files and directories, choose **Recycle Bin** or **permanent** removal for the batch. Recycle Bin allows recovery until emptied and may not free disk space immediately. The preview lists every exact path, method, item count, and estimated logical size. Type `DELETE FILES` to confirm. Codex sessions use a separate **permanent** method through `codex delete <session-id>` to update provider records; type `DELETE CODEX` for that batch. Cancelling either batch does not authorize the other. All prompts finish before either batch executes: **B** returns without deleting anything, while **C** or a nonmatching confirmation skips that batch.
+For eligible files and directories, choose **U** for the Agent Purge undo folder, **R** for the Windows Recycle Bin, or **P** for permanent removal. The preview lists every exact path and repeats the chosen method, item count, and estimated logical size beside the confirmation. Confirm with the exact phrase shown: `MOVE TO UNDO`, `MOVE TO RECYCLE BIN`, or `DELETE FILES`. **M** changes only this batch's method, **C** skips this batch, and **B** returns to selection. Letters and phrases are case sensitive; incorrect entries repeat only the current prompt without removing anything.
+
+The undo folder is the recommended method when you may need to reverse a cleanup. Each run prints a copy-paste command such as `agent-purge restore <run-id> <hash>` before and after moving files. Restore checks the run hash, skips occupied original paths rather than overwriting them, and reports each result. Close the provider app before restoring. Saved files remain on their original volume in `.agent-purge-undo` beside the relevant provider storage root. The run manifest is in `.agent-purge-undo\runs` beside the Codex home directory. These folders are not removed automatically or by `uninstall`; they continue using disk space until you remove them manually after you no longer need the restore option.
+
+Recycle Bin items can be restored manually through Windows until the bin is emptied; Agent Purge cannot reliably target them by run ID. Permanent file removal has no restore command. Codex sessions use a separate permanent `codex delete <session-id>` operation to update provider records; they cannot use the undo folder or Recycle Bin. Confirm those sessions separately with `DELETE CODEX`. Cancelling either batch does not authorize the other, and all prompts finish before either batch executes.
 
 After cleanup, Agent Purge reports successful, skipped, and failed item counts and refreshes the inventory and sizes. Removed selections disappear; remaining eligible selections stay available for review. A failed multi-path item can be partially removed; check its per-path results before retrying.
 

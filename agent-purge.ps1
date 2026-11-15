@@ -532,6 +532,115 @@ function Invoke-FileRemoval([string]$Path, [string]$Method) {
     }
 }
 
+function Get-UndoRootForPath([string]$Path, $Context, [string]$Provider) {
+    $roots = if ($Provider -eq 'Codex') { @($Context.CodexRoot, $Context.CodexPackages) }
+        elseif ($Provider -eq 'Claude') { @($Context.ClaudeRoot, $Context.ClaudeVersions) }
+        else { throw 'Unknown undo provider' }
+    foreach ($root in $roots) {
+        if ((Get-FullPath $Path) -ne (Get-FullPath $root) -and (Test-Within $Path $root)) {
+            return (Join-Path (Split-Path -Parent $root) '.agent-purge-undo')
+        }
+    }
+    throw "Undo path is outside known $Provider storage: $Path"
+}
+
+function Initialize-UndoRoot([string]$Root) {
+    $marker = Join-Path $Root 'agent-purge-undo-v1.marker'
+    if (-not (Test-NoReparse (Split-Path -Parent $Root))) { throw "Unsafe undo parent: $Root" }
+    if (Test-Path -LiteralPath $Root) {
+        if (-not (Test-NoReparse $Root) -or -not (Test-Path -LiteralPath $marker -PathType Leaf) -or -not (Test-NoReparse $marker) -or
+            (Get-Content -LiteralPath $marker -Raw -ErrorAction Stop).Trim() -cne 'agent-purge-undo-v1') {
+            throw "Undo folder exists without a valid Agent Purge marker: $Root"
+        }
+    } else {
+        New-Item -ItemType Directory -Path $Root -ErrorAction Stop | Out-Null
+        if (-not (Test-NoReparse $Root)) { throw "Unsafe undo folder: $Root" }
+        [IO.File]::WriteAllText($marker, 'agent-purge-undo-v1', [Text.Encoding]::ASCII)
+    }
+}
+
+function Get-UndoHash($Run) {
+    $plan = [ordered]@{
+        RunId = [string]$Run.RunId
+        Entries = @($Run.Entries | ForEach-Object {
+            [ordered]@{ Original = [string]$_.Original; Archived = [string]$_.Archived; Provider = [string]$_.Provider; Index = [int]$_.Index }
+        })
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes(($plan | ConvertTo-Json -Compress -Depth 5))
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') }
+    finally { $sha.Dispose() }
+}
+
+function New-UndoRun($Items, $Context) {
+    $runId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [guid]::NewGuid().ToString('N')
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($item in $Items) {
+        foreach ($path in (Get-ItemPaths $item)) {
+            $root = Get-UndoRootForPath $path $Context $item.Provider
+            $entries.Add([pscustomobject]@{
+                Index = $entries.Count; Original = (Get-FullPath $path)
+                Archived = (Join-Path (Join-Path (Join-Path $root 'payload') $runId) ([string]$entries.Count))
+                Provider = $item.Provider
+            })
+        }
+    }
+    $run = [pscustomobject]@{ RunId = $runId; Entries = $entries.ToArray(); Hash = '' }
+    $run.Hash = Get-UndoHash $run
+    $manifestRoot = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
+    foreach ($root in @($manifestRoot) + @($run.Entries | ForEach-Object { Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $_.Archived)) } | Select-Object -Unique)) {
+        Initialize-UndoRoot $root
+    }
+    $runs = Join-Path $manifestRoot 'runs'
+    New-Item -ItemType Directory -Path $runs -Force -ErrorAction Stop | Out-Null
+    $manifest = Join-Path $runs ($runId + '.json')
+    [IO.File]::WriteAllText($manifest, ($run | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+    return $run
+}
+
+function Invoke-UndoMove([string]$Original, [string]$Archived) {
+    $parent = Split-Path -Parent $Archived
+    $payload = Split-Path -Parent $parent
+    $root = Split-Path -Parent $payload
+    if (-not (Test-NoReparse $root) -or ((Test-Path -LiteralPath $payload) -and -not (Test-NoReparse $payload)) -or
+        ((Test-Path -LiteralPath $parent) -and -not (Test-NoReparse $parent))) { throw 'Unsafe undo destination' }
+    New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+    if (-not (Test-NoReparse $parent) -or (Test-Path -LiteralPath $Archived)) { throw 'Unsafe or occupied undo destination' }
+    if ([IO.Path]::GetPathRoot($Original) -ne [IO.Path]::GetPathRoot($Archived)) { throw 'Undo folder must be on the source volume' }
+    $entry = Get-Item -LiteralPath $Original -Force -ErrorAction Stop
+    if ($entry.PSIsContainer) { [IO.Directory]::Move($Original, $Archived) }
+    else { [IO.File]::Move($Original, $Archived) }
+}
+
+function Invoke-UndoRestore($Context, [string]$RunId, [string]$Hash) {
+    if ($RunId -cnotmatch '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$' -or $Hash -cnotmatch '^[0-9A-F]{64}$') { throw 'Invalid run ID or restore hash format' }
+    $root = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
+    if (-not (Test-Path -LiteralPath $root)) { throw 'Undo folder not found' }
+    Initialize-UndoRoot $root
+    $manifest = Join-Path (Join-Path $root 'runs') ($RunId + '.json')
+    if (-not (Test-NoReparse $manifest)) { throw 'Unsafe undo manifest path' }
+    $run = Get-Content -LiteralPath $manifest -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($run.RunId -cne $RunId -or $run.Hash -cne $Hash -or (Get-UndoHash $run) -cne $Hash) { throw 'Restore hash does not match this undo run' }
+    $restored = 0; $skipped = 0
+    foreach ($entry in $run.Entries) {
+        try {
+            $archiveRoot = Get-UndoRootForPath $entry.Original $Context $entry.Provider
+            $expected = Join-Path (Join-Path (Join-Path $archiveRoot 'payload') $RunId) ([string]$entry.Index)
+            if ($entry.Archived -cne $expected) { throw 'Undo manifest path mismatch' }
+            Initialize-UndoRoot $archiveRoot
+            if (-not (Test-Path -LiteralPath $entry.Archived)) { $skipped++; Write-Host "SKIP not archived: $($entry.Original)"; continue }
+            if (Test-Path -LiteralPath $entry.Original) { throw 'Original path already exists; no overwrite' }
+            if (-not (Test-AppClosed $entry.Provider)) { throw "Close $($entry.Provider) before restore" }
+            if (-not (Test-NoReparse $entry.Archived $true) -or -not (Test-NoReparse (Split-Path -Parent $entry.Original))) { throw 'Reparse point, missing parent, or unreadable path' }
+            $archived = Get-Item -LiteralPath $entry.Archived -Force -ErrorAction Stop
+            if ($archived.PSIsContainer) { [IO.Directory]::Move($entry.Archived, $entry.Original) }
+            else { [IO.File]::Move($entry.Archived, $entry.Original) }
+            $restored++; Write-Host "RESTORED $($entry.Original)"
+        } catch { $skipped++; Write-Host "SKIP $($entry.Original): $($_.Exception.Message)" }
+    }
+    Write-Host "Restore results: $restored restored, $skipped skipped. Any files still archived continue using disk space."
+}
+
 function Invoke-CodexDeletion([string]$Id) {
     $command = Get-Command codex -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $command) { throw 'codex CLI unavailable' }
@@ -552,43 +661,66 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
     }
     Write-Host 'Close the relevant provider apps before proceeding. Source-project files are not cleanup targets.'
     Write-Host 'Review both methods below. Nothing is removed until all prompts are finished.'
+    Write-Host 'Choices and confirmation phrases are case sensitive. Use uppercase letters exactly as shown.'
     Write-Host 'B = back to selection without deleting anything. C = skip the current batch.'
     $confirmFiles = $false; $confirmCodex = $false
     $preview = @{}
     $before = Get-FreeSpace $selected
     if ($files.Count) {
         Write-Host "`nFile cleanup: $($files.Count) items"
-        Write-Host 'Recycle Bin allows recovery until emptied; it may not free disk space immediately.'
+        Write-Host 'Undo folder allows a run-based restore, but keeps using disk space until removed manually.'
+        Write-Host 'Recycle Bin allows manual recovery until emptied; it may not free disk space immediately.'
         Write-Host 'Permanent removal cannot be undone through the Recycle Bin.'
-        do { $choice = (Read-Host 'Method: R = Recycle Bin (recommended), P = permanent, C = skip, B = back').Trim().ToUpperInvariant() } while ($choice -notin @('R', 'P', 'C', 'B'))
-        if ($choice -eq 'B') { return }
-        if ($choice -in @('R', 'P')) {
-            $method = if ($choice -eq 'R') { 'Recycle Bin' } else { 'Permanent' }
+        while ($true) {
+            do {
+                $choice = (Read-Host 'Method: U = Undo folder (recommended), R = Recycle Bin, P = permanent, C = skip, B = back (case sensitive)').Trim()
+                if ($choice -cnotin @('U', 'R', 'P', 'C', 'B')) { Write-Host 'Use an uppercase choice exactly as shown.' -ForegroundColor Yellow }
+            } while ($choice -cnotin @('U', 'R', 'P', 'C', 'B'))
+            if ($choice -ceq 'B') { return }
+            if ($choice -ceq 'C') { Write-Host 'File cleanup skipped.'; break }
+            $method = if ($choice -ceq 'U') { 'Undo folder' } elseif ($choice -ceq 'R') { 'Recycle Bin' } else { 'Permanent' }
             [long]$bytes = 0
             foreach ($item in $files) {
                 $bytes += $item.Bytes
                 $preview[$item.Key] = @(Get-ItemPaths $item)
                 foreach ($path in $preview[$item.Key]) { Write-Host ("  {0} | {1}" -f $method, $path) }
             }
-            Write-Host ("{0} items, {1} estimated logical size." -f $files.Count, (Format-Bytes $bytes))
-            $answer = Read-Host 'Type DELETE FILES to confirm, B to go back, or anything else to skip'
-            if ($answer.Trim() -ieq 'B') { return }
-            $confirmFiles = $answer -ceq 'DELETE FILES'
-            if (-not $confirmFiles) { Write-Host 'File cleanup cancelled.' }
-        } else { Write-Host 'File cleanup cancelled.' }
+            Write-Host ("Selected for {0}: {1} items, {2} estimated logical size." -f $method, $files.Count, (Format-Bytes $bytes))
+            $phrase = if ($method -eq 'Undo folder') { 'MOVE TO UNDO' } elseif ($method -eq 'Recycle Bin') { 'MOVE TO RECYCLE BIN' } else { 'DELETE FILES' }
+            Write-Host ("Confirmed items will {0}." -f $(if ($method -eq 'Permanent') { 'be removed permanently' } else { 'move to the ' + $method }))
+            do {
+                $answer = Read-Host "Type $phrase to confirm, M to change method, C to skip, B to go back (case sensitive)"
+                if ($answer -cnotin @($phrase, 'M', 'C', 'B')) { Write-Host 'No action taken. Enter the exact uppercase phrase or choice shown.' -ForegroundColor Yellow }
+            } while ($answer -cnotin @($phrase, 'M', 'C', 'B'))
+            if ($answer -ceq 'B') { return }
+            if ($answer -ceq 'M') { continue }
+            $confirmFiles = $answer -ceq $phrase
+            if (-not $confirmFiles) { Write-Host 'File cleanup skipped.' }
+            break
+        }
     }
     if ($codex.Count) {
         Write-Host "`nCodex sessions: $($codex.Count) permanent deletions via codex delete"
         [long]$bytes = 0
         foreach ($item in $codex) { $bytes += $item.Bytes; Write-Host ("  codex delete {0} | {1}" -f $item.Id, $item.Path) }
-        Write-Host ("{0} items, {1} estimated logical size." -f $codex.Count, (Format-Bytes $bytes))
-        Write-Host 'Codex uses its own deletion command to update session records. There is no Recycle Bin option.'
-        $answer = Read-Host 'Type DELETE CODEX to confirm, B to go back, or anything else to skip'
-        if ($answer.Trim() -ieq 'B') { return }
+        Write-Host ("Selected for permanent codex delete: {0} items, {1} estimated logical size." -f $codex.Count, (Format-Bytes $bytes))
+        Write-Host 'Codex uses its own deletion command to update session records. These sessions cannot use the undo folder or Recycle Bin.'
+        do {
+            $answer = Read-Host 'Type DELETE CODEX to confirm, C to skip this batch, B to go back (case sensitive)'
+            if ($answer -cnotin @('DELETE CODEX', 'C', 'B')) { Write-Host 'No action taken. Enter the exact uppercase phrase or choice shown.' -ForegroundColor Yellow }
+        } while ($answer -cnotin @('DELETE CODEX', 'C', 'B'))
+        if ($answer -ceq 'B') { return }
         $confirmCodex = $answer -ceq 'DELETE CODEX'
-        if (-not $confirmCodex) { Write-Host 'Codex cleanup cancelled.' }
+        if (-not $confirmCodex) { Write-Host 'Codex cleanup skipped.' }
     }
     if (-not $confirmFiles -and -not $confirmCodex) { return }
+    $undoRun = $null; $undoPaths = @{}
+    if ($confirmFiles -and $method -eq 'Undo folder') {
+        $undoRun = New-UndoRun $files $Context
+        foreach ($entry in $undoRun.Entries) { $undoPaths[$entry.Original] = $entry.Archived }
+        Write-Host ("Undo run: {0}" -f $undoRun.RunId)
+        Write-Host ("Restore command: agent-purge restore {0} {1}" -f $undoRun.RunId, $undoRun.Hash)
+    }
     $succeeded = 0; $skipped = 0; $failed = 0
     if ($confirmFiles) {
         foreach ($item in $files) {
@@ -602,7 +734,8 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
             foreach ($path in $was) {
                 try {
                     if (-not (Test-NoReparse $path $true)) { throw 'Reparse point or unreadable path' }
-                    Invoke-FileRemoval $path $method
+                    if ($undoRun) { Invoke-UndoMove $path $undoPaths[(Get-FullPath $path)] }
+                    else { Invoke-FileRemoval $path $method }
                     Write-Host "OK $method $path"
                 } catch { $itemFailed = $true; Write-Host "FAIL $path`: $($_.Exception.Message)" }
             }
@@ -621,6 +754,10 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
         }
     }
     Write-Host ("Cleanup results: {0} succeeded, {1} skipped, {2} failed items." -f $succeeded, $skipped, $failed)
+    if ($undoRun) {
+        Write-Host ("Restore this run: agent-purge restore {0} {1}" -f $undoRun.RunId, $undoRun.Hash)
+        Write-Host 'Undo data still uses disk space. Codex deletions, if confirmed separately, are not part of this restore.'
+    }
     $after = Get-FreeSpace $selected
     foreach ($root in $before.Keys) {
         if ($after.ContainsKey($root)) { Write-Host ("Free space {0}: {1} -> {2}" -f $root, (Format-Bytes $before[$root]), (Format-Bytes $after[$root])) }
@@ -724,7 +861,7 @@ function Invoke-ProjectPicker($Session) {
             $focus = $groups[$index]
             $breakdown = @((Format-SizeDistribution $focus.Items Provider)) + @((Format-SizeDistribution $focus.Items Category))
         }
-        $limit = Get-PageSize (14 + $breakdown.Count)
+        $limit = Get-PageSize (15 + $breakdown.Count)
         $start = [math]::Max(0, $index - $limit + 1)
         for ($i = $start; $i -lt [math]::Min($groups.Count, $start + $limit); $i++) {
             $group = $groups[$i]
@@ -739,6 +876,7 @@ function Invoke-ProjectPicker($Session) {
             Write-ScreenLine ('Project/group {0}/{1} | [x] selected  [~] partly selected  [-] inspect only' -f ($index + 1), $groups.Count) DarkGray
             Write-ScreenLine ('Focused: ' + (Format-ProjectLabel $focus.Label ((Get-TerminalSize).Width - 10))) Cyan
             Write-ScreenLine ('{0} items | {1} eligible for cleanup' -f $focus.Summary.Count, (Format-Bytes $focus.Summary.EligibleBytes))
+            Write-ScreenLine ('Your selection here: {0} of {1} eligible items' -f (Get-InventorySummary $focus.Items $Session.Selected).SelectedCount, $focus.Summary.EligibleCount)
             foreach ($line in $breakdown) { Write-ScreenLine ('  ' + $line) }
         }
         Write-ScreenLine $notice Yellow
@@ -964,6 +1102,8 @@ Usage:
   agent-purge scan --global --advanced
                                     Also allow verified old runtimes and caches
   agent-purge scan --project <path> Inspect sessions in a project and descendants
+  agent-purge restore <run-id> <hash>
+                                    Restore files saved in an Agent Purge undo run
   agent-purge install               Install a user-local launcher and PATH entry
   agent-purge update                Install the latest published main script
   agent-purge uninstall             Remove installed files and that PATH entry
@@ -972,6 +1112,10 @@ Usage:
 Project picker: Up/Down move, Space toggle, A select/clear all, Enter review,
 I inspect. Inspector: Enter open, D review, C copy resume from details.
 B/Backspace goes back; Esc or Ctrl+C twice quits. [x] selected, [~] partial, [-] inspect only.
+Undo folder keeps files for run-based restore; Recycle Bin needs manual restore.
+At file cleanup: U undo folder, R Recycle Bin, P permanent, C skip, B back.
+Codex sessions use separate permanent deletion and cannot be restored by this command.
+Cleanup letters and confirmation phrases are case sensitive.
 Sizes show inventoried agent storage by project/provider/category, not source folders.
 Clean --all never removes protected items and still requires typed confirmation.
 Redirected scan and clean commands only print inventory; they never remove data.
@@ -1043,6 +1187,10 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'update') { [void](Update-AgentPurge); return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
+        if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'restore') {
+            Invoke-UndoRestore (New-AgentPurgeContext) $Arguments[1] $Arguments[2]
+            return
+        }
         if ($Arguments[0] -notin @('scan', 'clean')) { throw 'Unknown command. Use --help.' }
         $clean = $Arguments[0] -eq 'clean'
         $advanced = $false; $selectAll = $false; $project = ''

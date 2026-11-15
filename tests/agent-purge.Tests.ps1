@@ -171,25 +171,66 @@ c.close()
     function Read-Host { param([string]$Prompt) return $script:answers.Dequeue() }
     function Test-AppClosed { param([string]$Provider) return $true }
     function Invoke-CodexDeletion { param([string]$Id) $script:deletedIds += $Id }
-    foreach ($reviewAnswers in @(@('B'), @('P', 'B'), @('P', 'DELETE FILES', 'B'))) {
+    foreach ($reviewAnswers in @(@('B'), @('p', 'P', 'B'), @('P', 'delete files', 'B'), @('P', 'DELETE FILES', 'B'))) {
         foreach ($answer in $reviewAnswers) { $script:answers.Enqueue($answer) }
         Invoke-Cleanup @($confirmLog, ($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
         Assert ((Test-Path $confirmFile) -and $script:deletedIds.Count -eq 0) 'Back at any review prompt must leave both batches intact'
         Assert ($script:answers.Count -eq 0) 'Back consumes only the current review prompts'
     }
     $script:answers.Enqueue('C')
-    $script:answers.Enqueue('CANCEL')
+    $script:answers.Enqueue('cancel')
+    $script:answers.Enqueue('C')
     Invoke-Cleanup @($confirmLog, ($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
     Assert ((Test-Path $confirmFile) -and $script:deletedIds.Count -eq 0) 'Cancellation leaves both batches intact'
     $script:answers.Enqueue('P')
+    $script:answers.Enqueue('M')
+    $script:answers.Enqueue('P')
+    $script:answers.Enqueue('delete files')
     $script:answers.Enqueue('DELETE FILES')
-    $script:answers.Enqueue('CANCEL')
+    $script:answers.Enqueue('cancel')
+    $script:answers.Enqueue('C')
     Invoke-Cleanup @($confirmLog, ($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
     Assert (-not (Test-Path $confirmFile)) 'Confirmed file batch removed'
     Assert ($script:deletedIds.Count -eq 0) 'File confirmation does not authorize Codex'
     $script:answers.Enqueue('DELETE CODEX')
     Invoke-Cleanup @(($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
     Assert ($script:deletedIds.Count -eq 1 -and $script:deletedIds[0] -eq $cid) 'Separate Codex confirmation'
+    $undoFile = Join-Path $claudeRoot 'debug\undo.txt'
+    Set-Content -LiteralPath $undoFile -Value 'undo content'
+    $undoCache = Join-Path $claudeRoot 'cache\undo-folder'
+    New-Item -ItemType Directory -Path $undoCache | Out-Null
+    Set-Content -LiteralPath (Join-Path $undoCache 'child.txt') -Value 'cache content'
+    $undoLogItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $undoFile '' '' '' '' '' '' $true
+    $undoCacheItem = New-InventoryItem $ctx 'Claude' 'Caches' 'Cache' $undoCache '' '' '' '' '' '' $true
+    foreach ($answer in @('u', 'U', 'move to undo', 'MOVE TO UNDO')) { $script:answers.Enqueue($answer) }
+    Invoke-Cleanup @($undoLogItem, $undoCacheItem) $ctx $true | Out-Null
+    $undoRoot = Join-Path $fixture '.agent-purge-undo'
+    $manifestFile = @(Get-ChildItem -LiteralPath (Join-Path $undoRoot 'runs') -Filter '*.json')[0].FullName
+    $run = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
+    Assert (-not (Test-Path $undoFile) -and -not (Test-Path $undoCache) -and $run.Entries.Count -eq 2) 'Undo run archives selected file and directory only'
+    Assert ($script:answers.Count -eq 0 -and $run.Hash -eq (Get-UndoHash $run)) 'Undo confirmation is case sensitive and manifest hash matches'
+    $badHashRejected = $false
+    try { Invoke-UndoRestore $ctx $run.RunId ('0' * 64) | Out-Null } catch { $badHashRejected = $true }
+    Assert $badHashRejected 'Incorrect restore hash is rejected before moving files'
+    $tampered = Get-Content -LiteralPath $manifestFile -Raw
+    $changed = $tampered.Replace('undo.txt', 'other.txt')
+    Set-Content -LiteralPath $manifestFile -Value $changed
+    $tamperedRejected = $false
+    try { Invoke-UndoRestore $ctx $run.RunId $run.Hash | Out-Null } catch { $tamperedRejected = $true }
+    Assert $tamperedRejected 'Changed undo manifest is rejected before moving files'
+    [IO.File]::WriteAllText($manifestFile, $tampered, [Text.Encoding]::UTF8)
+    Set-Content -LiteralPath $undoFile -Value 'new data'
+    Invoke-UndoRestore $ctx $run.RunId $run.Hash | Out-Null
+    Assert ((Get-Content $undoFile -Raw) -match 'new data' -and (Test-Path $undoCache)) 'Restore does not overwrite an occupied original path and continues other entries'
+    Remove-Item -LiteralPath $undoFile -Force
+    Invoke-UndoRestore $ctx $run.RunId $run.Hash | Out-Null
+    Assert ((Get-Content $undoFile -Raw) -match 'undo content' -and (Get-Content (Join-Path $undoCache 'child.txt') -Raw) -match 'cache content') 'Restore recovers archived file and directory'
+    $recycleConfirmFile = Join-Path $claudeRoot 'debug\recycle-confirm.txt'
+    Set-Content -LiteralPath $recycleConfirmFile -Value 'recycle content'
+    $recycleConfirmItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $recycleConfirmFile '' '' '' '' '' '' $true
+    foreach ($answer in @('R', 'MOVE TO RECYCLE BIN')) { $script:answers.Enqueue($answer) }
+    Invoke-Cleanup @($recycleConfirmItem) $ctx | Out-Null
+    Assert (-not (Test-Path $recycleConfirmFile)) 'Recycle Bin batch uses its exact confirmation phrase'
     $installRoot = Join-Path $fixture 'install'
     $oldPath = [Environment]::GetEnvironmentVariable('Path', 'Process')
     $originalSource = $script:AgentPurgeScript
@@ -362,6 +403,9 @@ c.close()
         Assert $rejected ('Reject unsupported or conflicting arguments: ' + ($invalid -join ' '))
     }
     Assert ($script:scanRequests.Count -eq $requestCount) 'Invalid commands fail before scanning'
+    function New-AgentPurgeContext { return $ctx }
+    Invoke-AgentPurge @('restore', $run.RunId, $run.Hash) | Out-Null
+    Assert ((Test-Path $undoFile) -and (Test-Path $undoCache)) 'Restore command dispatch accepts a completed fixture run'
     Invoke-AgentPurge @()
     Assert ($script:homeMenuCount -eq 6) 'Empty command opens the home menu'
     function Test-InteractiveTerminal { return $false }
@@ -369,7 +413,7 @@ c.close()
     $readOnly = (Invoke-AgentPurge @('clean', '--all')) -join "`n"
     Assert ($null -eq $script:capturedSession -and $readOnly -match 'Read-only inventory' -and $readOnly -match 'By project' -and $readOnly -match 'incomplete') 'Redirected clean-all only prints inventory including incomplete-size context'
     Assert ($script:deletedIds.Count -eq 1 -and (Test-Path -LiteralPath $claudeFile)) 'UI and command tests never delete provider sessions'
-    Write-Output 'PASS: fixtures, sizes, project selection, keyboard flows, cleanup/back safety, command dispatch, both file methods, install/update/uninstall.'
+    Write-Output 'PASS: fixtures, sizes, project selection, keyboard flows, case-sensitive cleanup, undo restore, command dispatch, install/update/uninstall.'
 } finally {
     $full = Get-FullPath $fixture
     $tempRoot = Get-FullPath $env:TEMP
