@@ -162,7 +162,7 @@ function Get-SessionInventory($Context, [string]$ProjectPath = '') {
         foreach ($f in (Get-ChildItem -LiteralPath $codexSessions -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue)) {
             if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
             $head = Get-SessionHead $f.FullName 'Codex' $titles
-            if (-not $head.Id -or $f.Name -notmatch [regex]::Escape($head.Id) + '\.jsonl$') {
+            if (-not $head.Id -or -not $head.Cwd -or $f.Name -notmatch [regex]::Escape($head.Id) + '\.jsonl$') {
                 if (-not $ProjectPath) { $items.Add((New-InventoryItem $Context 'Codex' 'Sessions' 'Inspection' $f.FullName '' '' '' '' '' '' $false 'Session metadata unavailable')) }
                 continue
             }
@@ -378,14 +378,87 @@ function Test-AppClosed([string]$Provider) {
 
 function Format-Bytes([long]$Bytes) {
     if ($Bytes -lt 1024) { return "$Bytes B" }
+    [double]$value = $Bytes
     foreach ($unit in @('KB', 'MB', 'GB', 'TB')) {
-        $Bytes = [math]::Round($Bytes / 1024, 1)
-        if ($Bytes -lt 1024 -or $unit -eq 'TB') { return "$Bytes $unit" }
+        $value /= 1024
+        if ($value -lt 1024 -or $unit -eq 'TB') { return ('{0:0.#} {1}' -f $value, $unit) }
+    }
+}
+
+function Get-InventorySummary($Items, $Selected = @{}) {
+    $summary = [pscustomobject]@{ Count = 0; Bytes = [long]0; EligibleCount = 0; EligibleBytes = [long]0; SelectedCount = 0; SelectedBytes = [long]0; Incomplete = $false }
+    foreach ($item in $Items) {
+        $summary.Count++; $summary.Bytes += $item.Bytes
+        $summary.Incomplete = $summary.Incomplete -or $item.Incomplete
+        if ($item.Eligible) {
+            $summary.EligibleCount++; $summary.EligibleBytes += $item.Bytes
+            if ($Selected.ContainsKey($item.Key)) { $summary.SelectedCount++; $summary.SelectedBytes += $item.Bytes }
+        }
+    }
+    return $summary
+}
+
+function Get-ProjectGroups($Items) {
+    $groups = @{}
+    foreach ($item in $Items) {
+        $label = 'Shared provider storage (logs, caches, runtimes, other)'
+        $key = 'shared'
+        if ($item.Project) {
+            try { $label = Get-FullPath $item.Project } catch { $label = $item.Project }
+            $key = 'project:' + $label
+        } elseif ($item.Category -eq 'Sessions') {
+            $key = 'unknown'; $label = 'Sessions with unavailable project metadata'
+        }
+        if (-not $groups.ContainsKey($key)) {
+            $groups[$key] = [pscustomobject]@{ Key = $key; Label = $label; Items = (New-Object 'System.Collections.Generic.List[object]'); Summary = $null }
+        }
+        $groups[$key].Items.Add($item)
+    }
+    foreach ($group in $groups.Values) {
+        $group.Items = $group.Items.ToArray()
+        $group.Summary = Get-InventorySummary $group.Items
+    }
+    return @($groups.Values | Sort-Object @{Expression = { $_.Summary.Bytes }; Descending = $true}, Label)
+}
+
+function Switch-ItemSelection($Items, $Selected) {
+    $eligible = @($Items | Where-Object Eligible)
+    $allSelected = $eligible.Count -gt 0 -and @($eligible | Where-Object { -not $Selected.ContainsKey($_.Key) }).Count -eq 0
+    foreach ($item in $eligible) {
+        if ($allSelected) { $Selected.Remove($item.Key) } else { $Selected[$item.Key] = $true }
+    }
+}
+
+function Get-SelectionMark($Items, $Selected) {
+    $summary = Get-InventorySummary $Items $Selected
+    if (-not $summary.EligibleCount) { return '[-]' }
+    if ($summary.SelectedCount -eq $summary.EligibleCount) { return '[x]' }
+    if ($summary.SelectedCount) { return '[~]' }
+    return '[ ]'
+}
+
+function Format-SizeDistribution($Items, [string]$Property) {
+    $total = (Get-InventorySummary $Items).Bytes
+    foreach ($group in ($Items | Group-Object $Property | Sort-Object Name)) {
+        $summary = Get-InventorySummary $group.Group
+        $percent = if ($total -gt 0) { 100.0 * $summary.Bytes / $total } else { 0 }
+        $partial = if ($summary.Incomplete) { ' (incomplete)' } else { '' }
+        '{0}: {1} ({2:0.#}%){3}' -f $group.Name, (Format-Bytes $summary.Bytes), $percent, $partial
     }
 }
 
 function Write-InventoryText($Items) {
     if (-not @($Items).Count) { Write-Output 'No matching items.'; return }
+    $summary = Get-InventorySummary $Items
+    Write-Output ('Agent storage: {0} measured | {1} eligible for cleanup | {2} items' -f (Format-Bytes $summary.Bytes), (Format-Bytes $summary.EligibleBytes), $summary.Count)
+    Write-Output 'Logical sizes cover inventoried agent data, not source-project folders or guaranteed freed space.'
+    if ($summary.Incomplete) { Write-Output 'Some sizes are incomplete; totals are lower bounds.' }
+    Write-Output 'By project / shared storage (largest first):'
+    foreach ($group in (Get-ProjectGroups $Items)) {
+        Write-Output ('  {0} | {1} measured | {2} eligible' -f $group.Label, (Format-Bytes $group.Summary.Bytes), (Format-Bytes $group.Summary.EligibleBytes))
+        Write-Output ('    ' + ((Format-SizeDistribution $group.Items Provider) -join ' | '))
+        Write-Output ('    ' + ((Format-SizeDistribution $group.Items Category) -join ' | '))
+    }
     foreach ($group in ($Items | Group-Object Provider, Category | Sort-Object Name)) {
         [long]$total = 0
         foreach ($item in $group.Group) { $total += $item.Bytes }
@@ -409,24 +482,28 @@ function Get-ViewRows($Items, $State) {
 }
 
 function Update-NavState($State, [string]$Key, $Rows) {
+    if (-not $State.PSObject.Properties['History']) { $State | Add-Member -NotePropertyName History -NotePropertyValue @{} }
+    if ($Key -eq 'B' -or $Key -eq 'LeftArrow') { $Key = 'Backspace' }
     $count = @($Rows).Count
     switch ($Key) {
         'UpArrow' { if ($count) { $State.Index = ($State.Index + $count - 1) % $count } }
         'DownArrow' { if ($count) { $State.Index = ($State.Index + 1) % $count } }
         'Enter' {
             if ($count -and $State.Level -lt 3) {
+                $State.History[$State.Level] = $State.Index
                 if ($State.Level -eq 0) { $State.Provider = [string]$Rows[$State.Index] }
                 if ($State.Level -eq 1) { $State.Category = [string]$Rows[$State.Index] }
+                if ($State.Level -eq 2) { $State.DetailKey = $Rows[$State.Index].Key }
                 $State.Level++; $State.Index = 0
             }
         }
-        'Backspace' { if ($State.Level -gt 0) { $State.Level--; $State.Index = 0 } }
+        'Backspace' { if ($State.Level -gt 0) { $State.Level--; $State.Index = [int]$State.History[$State.Level] } }
     }
     return $State
 }
 
 function Get-SelectedItems($Items, $Selected) {
-    return @($Items | Where-Object { $Selected.ContainsKey($_.Key) })
+    return @($Items | Where-Object { $_.Eligible -and $Selected.ContainsKey($_.Key) })
 }
 
 function Get-FreeSpace($Items) {
@@ -463,41 +540,41 @@ function Invoke-CodexDeletion([string]$Id) {
 }
 
 function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
-    $selected = @($Items)
+    $selected = @($Items | Where-Object Eligible)
     if (-not $selected.Count) { Write-Host 'Nothing selected.'; return }
     $files = @($selected | Where-Object Kind -ne 'CodexSession')
     $codex = @($selected | Where-Object Kind -eq 'CodexSession')
+    $summary = Get-InventorySummary $selected
+    Write-Host "`nREVIEW CLEANUP"
+    Write-Host ('{0} selected items | {1} estimated logical size' -f $summary.Count, (Format-Bytes $summary.Bytes))
+    foreach ($group in (Get-ProjectGroups $selected)) {
+        Write-Host ('  {0} | {1} | {2} items' -f $group.Label, (Format-Bytes $group.Summary.Bytes), $group.Summary.Count)
+    }
+    Write-Host 'Close the relevant provider apps before proceeding. Source-project files are not cleanup targets.'
+    Write-Host 'Review both methods below. Nothing is removed until all prompts are finished.'
+    Write-Host 'B = back to selection without deleting anything. C = skip the current batch.'
+    $confirmFiles = $false; $confirmCodex = $false
+    $preview = @{}
     $before = Get-FreeSpace $selected
     if ($files.Count) {
         Write-Host "`nFile cleanup: $($files.Count) items"
-        $choice = (Read-Host 'Method: R = Recycle Bin, P = permanent, C = cancel').Trim().ToUpperInvariant()
+        Write-Host 'Recycle Bin allows recovery until emptied; it may not free disk space immediately.'
+        Write-Host 'Permanent removal cannot be undone through the Recycle Bin.'
+        do { $choice = (Read-Host 'Method: R = Recycle Bin (recommended), P = permanent, C = skip, B = back').Trim().ToUpperInvariant() } while ($choice -notin @('R', 'P', 'C', 'B'))
+        if ($choice -eq 'B') { return }
         if ($choice -in @('R', 'P')) {
             $method = if ($choice -eq 'R') { 'Recycle Bin' } else { 'Permanent' }
             [long]$bytes = 0
-            $preview = @{}
             foreach ($item in $files) {
                 $bytes += $item.Bytes
                 $preview[$item.Key] = @(Get-ItemPaths $item)
                 foreach ($path in $preview[$item.Key]) { Write-Host ("  {0} | {1}" -f $method, $path) }
             }
             Write-Host ("{0} items, {1} estimated logical size." -f $files.Count, (Format-Bytes $bytes))
-            if ((Read-Host 'Type DELETE FILES to confirm') -ceq 'DELETE FILES') {
-                foreach ($item in $files) {
-                    if (-not (Test-AppClosed $item.Provider)) { Write-Host "SKIP $($item.Path): close $($item.Provider) first"; continue }
-                    $reason = Test-SafeItem $item $Context $Advanced
-                    if ($reason) { Write-Host "SKIP $($item.Path): $reason"; continue }
-                    $now = @(Get-ItemPaths $item)
-                    $was = @($preview[$item.Key])
-                    if (($now -join [char]0) -cne ($was -join [char]0)) { Write-Host "SKIP $($item.Path): paths changed after preview"; continue }
-                    foreach ($path in $was) {
-                        try {
-                            if (-not (Test-NoReparse $path $true)) { throw 'Reparse point or unreadable path' }
-                            Invoke-FileRemoval $path $method
-                            Write-Host "OK $method $path"
-                        } catch { Write-Host "FAIL $path`: $($_.Exception.Message)" }
-                    }
-                }
-            } else { Write-Host 'File cleanup cancelled.' }
+            $answer = Read-Host 'Type DELETE FILES to confirm, B to go back, or anything else to skip'
+            if ($answer.Trim() -ieq 'B') { return }
+            $confirmFiles = $answer -ceq 'DELETE FILES'
+            if (-not $confirmFiles) { Write-Host 'File cleanup cancelled.' }
         } else { Write-Host 'File cleanup cancelled.' }
     }
     if ($codex.Count) {
@@ -505,70 +582,252 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
         [long]$bytes = 0
         foreach ($item in $codex) { $bytes += $item.Bytes; Write-Host ("  codex delete {0} | {1}" -f $item.Id, $item.Path) }
         Write-Host ("{0} items, {1} estimated logical size." -f $codex.Count, (Format-Bytes $bytes))
-        if ((Read-Host 'Type DELETE CODEX to confirm') -ceq 'DELETE CODEX') {
-            foreach ($item in $codex) {
-                if (-not (Test-AppClosed 'Codex')) { Write-Host "SKIP $($item.Id): close Codex first"; continue }
-                $reason = Test-SafeItem $item $Context $Advanced
-                if ($reason) { Write-Host "SKIP $($item.Id): $reason"; continue }
-                try {
-                    Invoke-CodexDeletion $item.Id
-                    Write-Host "OK codex delete $($item.Id)"
-                } catch { Write-Host "FAIL codex delete $($item.Id): $($_.Exception.Message)" }
-            }
-        } else { Write-Host 'Codex cleanup cancelled.' }
+        Write-Host 'Codex uses its own deletion command to update session records. There is no Recycle Bin option.'
+        $answer = Read-Host 'Type DELETE CODEX to confirm, B to go back, or anything else to skip'
+        if ($answer.Trim() -ieq 'B') { return }
+        $confirmCodex = $answer -ceq 'DELETE CODEX'
+        if (-not $confirmCodex) { Write-Host 'Codex cleanup cancelled.' }
     }
+    if (-not $confirmFiles -and -not $confirmCodex) { return }
+    $succeeded = 0; $skipped = 0; $failed = 0
+    if ($confirmFiles) {
+        foreach ($item in $files) {
+            if (-not (Test-AppClosed $item.Provider)) { $skipped++; Write-Host "SKIP $($item.Path): close $($item.Provider) first"; continue }
+            $reason = Test-SafeItem $item $Context $Advanced
+            if ($reason) { $skipped++; Write-Host "SKIP $($item.Path): $reason"; continue }
+            $now = @(Get-ItemPaths $item)
+            $was = @($preview[$item.Key])
+            if (($now -join [char]0) -cne ($was -join [char]0)) { $skipped++; Write-Host "SKIP $($item.Path): paths changed after preview"; continue }
+            $itemFailed = $false
+            foreach ($path in $was) {
+                try {
+                    if (-not (Test-NoReparse $path $true)) { throw 'Reparse point or unreadable path' }
+                    Invoke-FileRemoval $path $method
+                    Write-Host "OK $method $path"
+                } catch { $itemFailed = $true; Write-Host "FAIL $path`: $($_.Exception.Message)" }
+            }
+            if ($itemFailed) { $failed++ } else { $succeeded++ }
+        }
+    }
+    if ($confirmCodex) {
+        foreach ($item in $codex) {
+            if (-not (Test-AppClosed 'Codex')) { $skipped++; Write-Host "SKIP $($item.Id): close Codex first"; continue }
+            $reason = Test-SafeItem $item $Context $Advanced
+            if ($reason) { $skipped++; Write-Host "SKIP $($item.Id): $reason"; continue }
+            try {
+                Invoke-CodexDeletion $item.Id
+                $succeeded++; Write-Host "OK codex delete $($item.Id)"
+            } catch { $failed++; Write-Host "FAIL codex delete $($item.Id): $($_.Exception.Message)" }
+        }
+    }
+    Write-Host ("Cleanup results: {0} succeeded, {1} skipped, {2} failed items." -f $succeeded, $skipped, $failed)
     $after = Get-FreeSpace $selected
     foreach ($root in $before.Keys) {
         if ($after.ContainsKey($root)) { Write-Host ("Free space {0}: {1} -> {2}" -f $root, (Format-Bytes $before[$root]), (Format-Bytes $after[$root])) }
     }
+    return $true
 }
 
-function Invoke-InventoryUI($Items, $Context, [bool]$Advanced = $false) {
-    if ([Console]::IsInputRedirected) { Write-InventoryText $Items; return }
-    $state = [pscustomobject]@{ Level = 0; Provider = ''; Category = ''; Index = 0; DetailKey = '' }
-    $selected = @{}
+function Test-InteractiveTerminal { return -not [Console]::IsInputRedirected }
+function Read-MenuKey { return [Console]::ReadKey($true).Key.ToString() }
+
+function Get-TerminalSize {
+    $width = 100; $height = 25
+    try {
+        if ([Console]::WindowWidth -ge 20) { $width = [Console]::WindowWidth }
+        if ([Console]::WindowHeight -ge 10) { $height = [Console]::WindowHeight }
+    } catch { }
+    return [pscustomobject]@{ Width = $width; Height = $height }
+}
+
+function Write-ScreenLine([string]$Text, [ConsoleColor]$Color = 'Gray') {
+    $width = (Get-TerminalSize).Width
+    $clean = [regex]::Replace($Text, '[\x00-\x1f\x7f-\x9f]', ' ')
+    if ($clean.Length -ge $width) { $clean = $clean.Substring(0, $width - 4) + '...' }
+    Write-Host $clean -ForegroundColor $Color
+}
+
+function Format-ProjectLabel([string]$Label, [int]$Width) {
+    $clean = [regex]::Replace($Label, '[\x00-\x1f\x7f-\x9f]', ' ')
+    if ($clean.Length -le $Width -or $Width -lt 8) { return $clean }
+    $prefix = [math]::Min(16, [int][math]::Floor(($Width - 3) / 2))
+    return $clean.Substring(0, $prefix) + '...' + $clean.Substring($clean.Length - ($Width - $prefix - 3))
+}
+
+function Get-PageSize([int]$ReservedLines) {
+    $height = (Get-TerminalSize).Height
+    return [math]::Max(1, $height - $ReservedLines - 1)
+}
+
+function Write-SelectionSummary($Items, $Selected) {
+    $summary = Get-InventorySummary $Items $Selected
+    Write-ScreenLine ('Measured: {0} | Eligible: {1} | Selected: {2} ({3} items)' -f (Format-Bytes $summary.Bytes), (Format-Bytes $summary.EligibleBytes), (Format-Bytes $summary.SelectedBytes), $summary.SelectedCount) Cyan
+    if ($summary.Incomplete) { Write-ScreenLine 'Incomplete sizes: measured totals are lower bounds.' Yellow }
+    else { Write-ScreenLine 'Logical agent-storage sizes; source folders are not measured or deleted.' DarkGray }
+}
+
+function Get-ScanInventory($Context, [bool]$Advanced, [string]$ProjectPath = '') {
+    Write-Host 'Scanning agent storage and measuring sizes. This may take a moment...' -ForegroundColor Cyan
+    if ($ProjectPath) { return @(Get-SessionInventory $Context $ProjectPath) }
+    return @(Get-GlobalInventory $Context $Advanced)
+}
+
+function Invoke-SelectionCleanup($Session) {
+    $selectedItems = @(Get-SelectedItems $Session.Items $Session.Selected)
+    if (-not $selectedItems.Count) { return }
+    Clear-Host
+    $attempted = Invoke-Cleanup $selectedItems $Session.Context $Session.Advanced
+    if ($attempted) {
+        $Session.Items = @(Get-ScanInventory $Session.Context $Session.Advanced $Session.ProjectPath)
+        $remaining = @{}
+        foreach ($item in $Session.Items) { if ($item.Eligible) { $remaining[$item.Key] = $true } }
+        foreach ($key in @($Session.Selected.Keys)) { if (-not $remaining.ContainsKey($key)) { $Session.Selected.Remove($key) } }
+        Write-Host 'Inventory refreshed. Press any key to return to selection.'
+        [void](Read-MenuKey)
+    }
+}
+
+function Invoke-ProjectPicker($Session) {
+    $index = 0
+    $notice = ''
     while ($true) {
+        $groups = @(Get-ProjectGroups $Session.Items)
+        $index = [math]::Min($index, [math]::Max(0, $groups.Count - 1))
+        Clear-Host
+        $mode = if ($Session.Advanced) { ' / ADVANCED' } else { '' }
+        Write-ScreenLine ('AGENT PURGE / CHOOSE PROJECTS TO CLEAN' + $mode) Cyan
+        Write-ScreenLine 'Which projects have agent history you no longer need?'
+        Write-ScreenLine 'Space toggles eligible items in a project. Enter reviews your selection.'
+        Write-ScreenLine 'Projects use recorded working directories; shared storage is listed separately.' DarkGray
+        Write-SelectionSummary $Session.Items $Session.Selected
+        Write-ScreenLine ''
+        $breakdown = @()
+        if ($groups.Count) {
+            $focus = $groups[$index]
+            $breakdown = @((Format-SizeDistribution $focus.Items Provider)) + @((Format-SizeDistribution $focus.Items Category))
+        }
+        $limit = Get-PageSize (14 + $breakdown.Count)
+        $start = [math]::Max(0, $index - $limit + 1)
+        for ($i = $start; $i -lt [math]::Min($groups.Count, $start + $limit); $i++) {
+            $group = $groups[$i]
+            $cursor = if ($i -eq $index) { '>' } else { ' ' }
+            $color = if ($i -eq $index) { 'White' } else { 'Gray' }
+            $prefix = '{0} {1} {2,9} | ' -f $cursor, (Get-SelectionMark $group.Items $Session.Selected), (Format-Bytes $group.Summary.Bytes)
+            $label = Format-ProjectLabel $group.Label ((Get-TerminalSize).Width - $prefix.Length - 1)
+            Write-ScreenLine ($prefix + $label) $color
+        }
+        if (-not $groups.Count) { Write-ScreenLine 'No matching agent storage found.' }
+        else {
+            Write-ScreenLine ('Project/group {0}/{1} | [x] selected  [~] partly selected  [-] inspect only' -f ($index + 1), $groups.Count) DarkGray
+            Write-ScreenLine ('Focused: ' + (Format-ProjectLabel $focus.Label ((Get-TerminalSize).Width - 10))) Cyan
+            Write-ScreenLine ('{0} items | {1} eligible for cleanup' -f $focus.Summary.Count, (Format-Bytes $focus.Summary.EligibleBytes))
+            foreach ($line in $breakdown) { Write-ScreenLine ('  ' + $line) }
+        }
+        Write-ScreenLine $notice Yellow
+        Write-ScreenLine 'Up/Down move | Space toggle | A select/clear all | I inspect'
+        Write-ScreenLine 'Enter review cleanup | B/Backspace back | Esc quit'
+        $notice = ''
+        $key = Read-MenuKey
+        switch ($key) {
+            'Escape' { return 'Exit' }
+            { $_ -in @('B', 'Backspace', 'LeftArrow') } { return 'Back' }
+            'UpArrow' { if ($groups.Count) { $index = ($index + $groups.Count - 1) % $groups.Count } }
+            'DownArrow' { if ($groups.Count) { $index = ($index + 1) % $groups.Count } }
+            'Spacebar' {
+                if ($groups.Count) {
+                    Switch-ItemSelection $groups[$index].Items $Session.Selected
+                    if (-not $groups[$index].Summary.EligibleCount) { $notice = 'This group is inspection only. Press I to see why.' }
+                }
+            }
+            'A' { Switch-ItemSelection $Session.Items $Session.Selected }
+            { $_ -in @('I', 'RightArrow') } {
+                if ($groups.Count -and (Invoke-InventoryUI $Session $groups[$index].Key) -eq 'Exit') { return 'Exit' }
+            }
+            { $_ -in @('Enter', 'D') } {
+                if (@(Get-SelectedItems $Session.Items $Session.Selected).Count) { Invoke-SelectionCleanup $Session }
+                else { $notice = 'Nothing selected. Use Space on a project, or A to select all eligible items.' }
+            }
+        }
+    }
+}
+
+function Invoke-InventoryUI($Session, [string]$GroupKey = '') {
+    $state = [pscustomobject]@{ Level = 0; Provider = ''; Category = ''; Index = 0; DetailKey = '' }
+    $selected = $Session.Selected
+    $notice = ''
+    while ($true) {
+        $Items = $Session.Items
+        if ($GroupKey) {
+            $group = Get-ProjectGroups $Session.Items | Where-Object Key -eq $GroupKey | Select-Object -First 1
+            $Items = if ($group) { @($group.Items) } else { @() }
+        }
         $rows = @(Get-ViewRows $Items $state)
         if ($state.Index -ge $rows.Count) { $state.Index = [math]::Max(0, $rows.Count - 1) }
         Clear-Host
-        Write-Host ('Agent Purge | {0} selected | Esc quit | D cleanup' -f $selected.Count)
-        Write-Host 'Arrows navigate | Enter open | Space select | Backspace back | C copy resume'
-        Write-Host ("{0} {1}" -f $state.Provider, $state.Category)
+        Write-ScreenLine ('AGENT PURGE / INSPECT / {0} / {1}' -f $state.Provider, $state.Category) Cyan
+        $question = switch ($state.Level) {
+            0 { 'Which provider uses this storage? Enter opens its categories.' }
+            1 { 'What takes up space? Enter opens sessions, logs, caches, or protected items.' }
+            2 { 'Which items do you want to remove? Space toggles; Enter shows exact details.' }
+            3 { 'Review this item and its eligibility before selecting it.' }
+        }
+        Write-ScreenLine $question
+        Write-SelectionSummary $Session.Items $selected
+        Write-ScreenLine 'Space toggles eligible items in the focused row. [-] items remain protected.' DarkGray
+        $focusedItems = @()
         if ($state.Level -eq 3) {
             $item = $Items | Where-Object { $_.Key -eq $state.DetailKey } | Select-Object -First 1
             if ($item) {
+                $focusedItems = @($item)
                 foreach ($field in @('Provider', 'Project', 'Category', 'Date', 'Title', 'TitleSource', 'Path', 'Resume', 'Reason')) {
                     if ($item.$field) { Write-Host ("{0}: {1}" -f $field, $item.$field) }
                 }
                 Write-Host ('Size: {0}{1}' -f (Format-Bytes $item.Bytes), $(if ($item.Incomplete) { ' (incomplete)' } else { '' }))
-                Write-Host ('Selectable: ' + $item.Eligible)
-            }
+                Write-Host ('Selection: {0} | Eligible: {1}' -f (Get-SelectionMark @($item) $selected), $item.Eligible)
+            } else { Write-ScreenLine 'This item is no longer in the inventory. Use B to go back.' }
         } elseif (-not $rows.Count) { Write-Host 'No items.' }
         else {
-            $limit = [math]::Min($rows.Count, [math]::Max(8, [Console]::WindowHeight - 7))
+            $limit = Get-PageSize 10
             $start = [math]::Max(0, $state.Index - $limit + 1)
             for ($i = $start; $i -lt [math]::Min($rows.Count, $start + $limit); $i++) {
                 $mark = if ($i -eq $state.Index) { '>' } else { ' ' }
                 if ($state.Level -eq 2) {
                     $item = $rows[$i]
-                    $check = if ($selected.ContainsKey($item.Key)) { '[x]' } elseif ($item.Eligible) { '[ ]' } else { '[-]' }
-                    Write-Host ("{0} {1} {2} {3} {4}" -f $mark, $check, (Format-Bytes $item.Bytes), (Split-Path -Leaf $item.Path), $item.Title)
-                } else { Write-Host ("{0} {1}" -f $mark, $rows[$i]) }
+                    $rowItems = @($item)
+                    $label = if ($item.Title) { $item.Title } else { Split-Path -Leaf $item.Path }
+                } else {
+                    $rowItems = if ($state.Level -eq 0) { @($Items | Where-Object Provider -eq $rows[$i]) } else { @($Items | Where-Object { $_.Provider -eq $state.Provider -and $_.Category -eq $rows[$i] }) }
+                    $label = [string]$rows[$i]
+                }
+                if ($i -eq $state.Index) { $focusedItems = $rowItems }
+                $summary = Get-InventorySummary $rowItems
+                $partial = if ($summary.Incomplete) { ' (incomplete)' } else { '' }
+                Write-ScreenLine ('{0} {1} {2,9} | {3}{4}' -f $mark, (Get-SelectionMark $rowItems $selected), (Format-Bytes $summary.Bytes), $label, $partial)
             }
+            Write-ScreenLine ('Row {0}/{1} | Focused: {2} items, {3} eligible' -f ($state.Index + 1), $rows.Count, $focusedItems.Count, (Format-Bytes (Get-InventorySummary $focusedItems).EligibleBytes)) DarkGray
         }
-        $key = [Console]::ReadKey($true).Key.ToString()
-        if ($key -eq 'Escape') { return }
-        if ($key -eq 'D') { Invoke-Cleanup (Get-SelectedItems $Items $selected) $Context $Advanced; [void][Console]::ReadKey($true); continue }
-        if ($key -eq 'Spacebar' -and $state.Level -ge 2) {
-            $item = if ($state.Level -eq 3) { $Items | Where-Object Key -eq $state.DetailKey | Select-Object -First 1 } elseif ($rows.Count) { $rows[$state.Index] }
-            if ($item -and $item.Eligible) { if ($selected.ContainsKey($item.Key)) { $selected.Remove($item.Key) } else { $selected[$item.Key] = $true } }
+        Write-ScreenLine $notice Yellow
+        Write-ScreenLine 'Up/Down move | Enter open | Space toggle | A select/clear this view'
+        Write-ScreenLine 'D review cleanup | C copy resume | B/Backspace back | Esc quit'
+        $notice = ''
+        $key = Read-MenuKey
+        if ($key -eq 'Escape') { return 'Exit' }
+        if ($key -in @('B', 'Backspace', 'LeftArrow') -and $state.Level -eq 0) { return 'Back' }
+        if ($key -eq 'D') { Invoke-SelectionCleanup $Session; continue }
+        if ($key -eq 'Spacebar') { Switch-ItemSelection $focusedItems $selected; continue }
+        if ($key -eq 'A') {
+            $viewItems = switch ($state.Level) {
+                0 { $Items }
+                1 { $Items | Where-Object Provider -eq $state.Provider }
+                2 { $rows }
+                3 { $focusedItems }
+            }
+            Switch-ItemSelection $viewItems $selected; continue
+        }
+        if ($key -eq 'C' -and $state.Level -eq 3 -and $focusedItems.Count -and $focusedItems[0].Resume) {
+            try { Set-Clipboard -Value $focusedItems[0].Resume -ErrorAction Stop; $notice = 'Resume command copied.' } catch { $notice = 'Clipboard unavailable; use the resume command shown above.' }
             continue
         }
-        if ($key -eq 'C' -and $state.Level -eq 3 -and $item.Resume) {
-            try { Set-Clipboard -Value $item.Resume -ErrorAction Stop } catch { Write-Host "Clipboard unavailable: $($item.Resume)"; [void][Console]::ReadKey($true) }
-            continue
-        }
-        if ($key -eq 'Enter' -and $state.Level -eq 2 -and $rows.Count) { $state.DetailKey = $rows[$state.Index].Key; $state.Level = 3; continue }
         $state = Update-NavState $state $key $rows
     }
 }
@@ -622,7 +881,12 @@ function Show-AgentPurgeHelp {
 Agent Purge: inspect and selectively clean local Codex and Claude storage.
 
 Usage:
-  agent-purge                       Interactive global/project scope picker
+  agent-purge                       Guided menu with explanations and back navigation
+  agent-purge clean                 Choose projects with Space, then Enter to review
+  agent-purge clean --all           Preselect all eligible storage; review before deletion
+  agent-purge clean --all --advanced
+                                    Also select verified old runtimes and caches
+  agent-purge clean --project <path> Choose session history for a folder and descendants
   agent-purge scan --global         Inspect global provider storage
   agent-purge scan --global --advanced
                                     Also allow verified old runtimes and caches
@@ -631,44 +895,100 @@ Usage:
   agent-purge uninstall             Remove installed files and that PATH entry
   agent-purge --help                Show this help
 
-Keys: Up/Down navigate, Enter open, Space select, Backspace back, C copy resume
-command from detail, D review cleanup, Esc quit. Protected items show [-].
-Redirected scans print an inventory and cannot remove anything.
+Project picker: Up/Down move, Space toggle, A select/clear all, Enter review,
+I inspect. Inspector: Enter open, D review, C copy resume from details.
+B/Backspace goes back; Esc quits. [x] selected, [~] partial, [-] inspect only.
+Sizes show inventoried agent storage by project/provider/category, not source folders.
+Clean --all never removes protected items and still requires typed confirmation.
+Redirected scan and clean commands only print inventory; they never remove data.
 To update: pull the latest main branch in your Git checkout and run install again.
 '@ | Write-Output
 }
 
+function Show-StartMenu {
+    $labels = @('Choose projects to clean (recommended)', 'Inspect all agent storage', 'Clean all eligible storage', 'Choose one project folder', 'Exit')
+    $descriptions = @(
+        'See project sizes, toggle projects with Space, then review cleanup with Enter.',
+        'Browse providers and categories to understand storage and protected items.',
+        'Preselect eligible sessions and logs. You can deselect before confirming cleanup.',
+        'Limit session history to a project folder and its descendants.',
+        'Close Agent Purge without making further changes.'
+    )
+    $index = 0
+    while ($true) {
+        Clear-Host
+        Write-ScreenLine 'AGENT PURGE' Cyan
+        Write-ScreenLine 'What would you like to clean or inspect?'
+        Write-ScreenLine 'Find local Codex and Claude storage by project, provider, and category.'
+        Write-ScreenLine 'Source-project folders are never cleanup targets. Every deletion needs review.' DarkGray
+        Write-ScreenLine ''
+        for ($i = 0; $i -lt $labels.Count; $i++) {
+            $mark = if ($i -eq $index) { '>' } else { ' ' }
+            Write-ScreenLine ('{0} {1}' -f $mark, $labels[$i])
+        }
+        Write-ScreenLine ''
+        Write-ScreenLine $descriptions[$index] Cyan
+        Write-ScreenLine 'Up/Down move | Enter choose | Esc quit'
+        $key = Read-MenuKey
+        if ($key -eq 'Escape') { return }
+        if ($key -eq 'UpArrow') { $index = ($index + $labels.Count - 1) % $labels.Count; continue }
+        if ($key -eq 'DownArrow') { $index = ($index + 1) % $labels.Count; continue }
+        if ($key -eq 'G') { $index = 1; $key = 'Enter' }
+        if ($key -eq 'P') { $index = 3; $key = 'Enter' }
+        if ($key -eq 'C') { $index = 0; $key = 'Enter' }
+        if ($key -eq 'A') { $index = 2; $key = 'Enter' }
+        if ($key -ne 'Enter') { continue }
+        switch ($index) {
+            0 { return @('clean') }
+            1 { return @('scan', '--global') }
+            2 { return @('clean', '--all') }
+            3 {
+                Write-Host 'Enter a source-project folder to find its recorded agent history. Leave blank to go back.'
+                $path = (Read-Host 'Project folder').Trim().Trim('"')
+                if (-not $path) { continue }
+                if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+                    Write-Host "Folder not found: $path. Press any key to return."
+                    [void](Read-MenuKey); continue
+                }
+                return @('clean', '--project', $path)
+            }
+            4 { return }
+        }
+    }
+}
+
 function Invoke-AgentPurge([string[]]$Arguments) {
     if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core' -and $env:OS -ne 'Windows_NT') { throw 'Agent Purge requires Windows.' }
-    if (-not $Arguments.Count) {
-        if ([Console]::IsInputRedirected) { Show-AgentPurgeHelp; return }
-        Write-Host 'Agent Purge: G global scan, P project scan, Esc quit'
-        $key = [Console]::ReadKey($true).Key.ToString()
-        if ($key -eq 'Escape') { return }
-        if ($key -eq 'G') { $Arguments = @('scan', '--global') }
-        elseif ($key -eq 'P') { $Arguments = @('scan', '--project', (Read-Host 'Project path')) }
-        else { return }
-    }
-    if ($Arguments.Count -eq 1 -and $Arguments[0] -eq '--help') { Show-AgentPurgeHelp; return }
-    if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
-    if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
-    if ($Arguments[0] -ne 'scan') { throw 'Unknown command. Use --help.' }
-    $context = New-AgentPurgeContext
-    if ($Arguments.Count -eq 2 -and $Arguments[1] -eq '--global') {
-        Invoke-InventoryUI (Get-GlobalInventory $context $false) $context $false
-        return
-    }
-    if ($Arguments.Count -eq 3 -and $Arguments[1] -eq '--global' -and $Arguments[2] -eq '--advanced') {
-        Invoke-InventoryUI (Get-GlobalInventory $context $true) $context $true
-        return
-    }
-    if ($Arguments.Count -eq 3 -and $Arguments[1] -eq '--project') {
-        if (-not (Test-Path -LiteralPath $Arguments[2] -PathType Container)) { throw "Project directory not found: $($Arguments[2])" }
-        $project = (Get-Item -LiteralPath $Arguments[2]).FullName
-        Invoke-InventoryUI (Get-SessionInventory $context $project) $context $false
-        return
-    }
-    throw 'Invalid arguments. Use --help.'
+    $fromMenu = -not $Arguments.Count
+    if ($fromMenu -and -not (Test-InteractiveTerminal)) { Show-AgentPurgeHelp; return }
+    do {
+        if ($fromMenu) { $Arguments = @(Show-StartMenu); if (-not $Arguments.Count) { return } }
+        if ($Arguments.Count -eq 1 -and $Arguments[0] -eq '--help') { Show-AgentPurgeHelp; return }
+        if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
+        if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
+        if ($Arguments[0] -notin @('scan', 'clean')) { throw 'Unknown command. Use --help.' }
+        $clean = $Arguments[0] -eq 'clean'
+        $advanced = $false; $selectAll = $false; $project = ''
+        if ($Arguments.Count -eq 1 -and $clean) { }
+        elseif ($Arguments.Count -in @(2, 3) -and (($clean -and $Arguments[1] -eq '--all') -or (-not $clean -and $Arguments[1] -eq '--global')) -and ($Arguments.Count -eq 2 -or $Arguments[2] -eq '--advanced')) {
+            $selectAll = $clean
+            $advanced = $Arguments.Count -eq 3
+        } elseif ($Arguments.Count -eq 3 -and $Arguments[1] -eq '--project') {
+            if (-not (Test-Path -LiteralPath $Arguments[2] -PathType Container)) { throw "Project directory not found: $($Arguments[2])" }
+            $project = (Get-Item -LiteralPath $Arguments[2]).FullName
+        } else { throw 'Invalid arguments. Use --help.' }
+        $context = New-AgentPurgeContext
+        $items = @(Get-ScanInventory $context $advanced $project)
+        if (-not (Test-InteractiveTerminal)) {
+            Write-Output 'Read-only inventory: interactive selection and confirmation are required for cleanup.'
+            Write-InventoryText $items
+            return
+        }
+        $session = [pscustomobject]@{ Items = $items; Selected = @{}; Context = $context; Advanced = $advanced; ProjectPath = $project }
+        if ($selectAll) { Switch-ItemSelection $items $session.Selected }
+        $result = if ($clean) { Invoke-ProjectPicker $session } else { Invoke-InventoryUI $session }
+        if ($result -eq 'Exit') { return }
+    } while ($fromMenu)
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
