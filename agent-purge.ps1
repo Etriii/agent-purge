@@ -629,7 +629,25 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
 }
 
 function Test-InteractiveTerminal { return -not [Console]::IsInputRedirected }
-function Read-MenuKey { return [Console]::ReadKey($true).Key.ToString() }
+function Read-MenuKey {
+    $previous = [Console]::TreatControlCAsInput
+    try {
+        [Console]::TreatControlCAsInput = $true
+        $controlC = $false
+        while ($true) {
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq [ConsoleKey]::C -and ($key.Modifiers -band [ConsoleModifiers]::Control)) {
+                if ($controlC) { return 'Escape' }
+                $controlC = $true
+                Write-Host 'Press Ctrl+C again to quit, or any other key to continue.' -ForegroundColor Yellow
+                continue
+            }
+            return $key.Key.ToString()
+        }
+    } finally {
+        [Console]::TreatControlCAsInput = $previous
+    }
+}
 
 function Get-TerminalSize {
     $width = 100; $height = 25
@@ -725,12 +743,12 @@ function Invoke-ProjectPicker($Session) {
         }
         Write-ScreenLine $notice Yellow
         Write-ScreenLine 'Up/Down move | Space toggle | A select/clear all | I inspect'
-        Write-ScreenLine 'Enter review cleanup | B/Backspace back | Esc quit'
+        Write-ScreenLine 'Enter review cleanup | B/Backspace back | Esc/Ctrl+C twice quit'
         $notice = ''
         $key = Read-MenuKey
         switch ($key) {
             'Escape' { return 'Exit' }
-            { $_ -in @('B', 'Backspace', 'LeftArrow') } { return 'Back' }
+            { $_ -in @('B', 'Backspace') } { return 'Back' }
             'UpArrow' { if ($groups.Count) { $index = ($index + $groups.Count - 1) % $groups.Count } }
             'DownArrow' { if ($groups.Count) { $index = ($index + 1) % $groups.Count } }
             'Spacebar' {
@@ -808,11 +826,11 @@ function Invoke-InventoryUI($Session, [string]$GroupKey = '') {
         }
         Write-ScreenLine $notice Yellow
         Write-ScreenLine 'Up/Down move | Enter open | Space toggle | A select/clear this view'
-        Write-ScreenLine 'D review cleanup | C copy resume | B/Backspace back | Esc quit'
+        Write-ScreenLine 'D review cleanup | C copy resume | B/Backspace back | Esc/Ctrl+C twice quit'
         $notice = ''
         $key = Read-MenuKey
         if ($key -eq 'Escape') { return 'Exit' }
-        if ($key -in @('B', 'Backspace', 'LeftArrow') -and $state.Level -eq 0) { return 'Back' }
+        if ($key -in @('B', 'Backspace') -and $state.Level -eq 0) { return 'Back' }
         if ($key -eq 'D') { Invoke-SelectionCleanup $Session; continue }
         if ($key -eq 'Spacebar') { Switch-ItemSelection $focusedItems $selected; continue }
         if ($key -eq 'A') {
@@ -953,7 +971,7 @@ Usage:
 
 Project picker: Up/Down move, Space toggle, A select/clear all, Enter review,
 I inspect. Inspector: Enter open, D review, C copy resume from details.
-B/Backspace goes back; Esc quits. [x] selected, [~] partial, [-] inspect only.
+B/Backspace goes back; Esc or Ctrl+C twice quits. [x] selected, [~] partial, [-] inspect only.
 Sizes show inventoried agent storage by project/provider/category, not source folders.
 Clean --all never removes protected items and still requires typed confirmation.
 Redirected scan and clean commands only print inventory; they never remove data.
@@ -985,7 +1003,7 @@ function Show-StartMenu {
         }
         Write-ScreenLine ''
         Write-ScreenLine $descriptions[$index] Cyan
-        Write-ScreenLine 'Up/Down move | Enter choose | Esc quit'
+        Write-ScreenLine 'Up/Down move | Enter choose | Esc/Ctrl+C twice quit'
         $key = Read-MenuKey
         if ($key -eq 'Escape') { return }
         if ($key -eq 'UpArrow') { $index = ($index + $labels.Count - 1) % $labels.Count; continue }
@@ -1048,6 +1066,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($selectAll) { Switch-ItemSelection $items $session.Selected }
         $result = if ($clean) { Invoke-ProjectPicker $session } else { Invoke-InventoryUI $session }
         if ($result -eq 'Exit') { return }
+        if ($result -eq 'Back') { $fromMenu = $true }
     } while ($fromMenu)
 }
 

@@ -288,6 +288,8 @@ c.close()
     Assert ($ui.Selected.Count -eq 1) 'Selection persists through nested inspector and cancelled review'
     Assert ($script:screen -match 'Which projects' -and $script:screen -match 'Selected:' -and $script:screen -match '100%') 'Picker shows context, selected size, and distributions'
     Assert ($script:keys.Count -eq 0 -and $script:answers.Count -eq 0) 'Menu flow consumes the expected input only'
+    foreach ($key in @('LeftArrow', 'DownArrow', 'UpArrow', 'Escape')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $ui) -eq 'Exit' -and $script:keys.Count -eq 0) 'Picker arrows stay in selection until Escape'
     foreach ($key in @('A', 'Escape')) { $script:keys.Enqueue($key) }
     Assert ((Invoke-ProjectPicker $ui) -eq 'Exit') 'Escape exits the picker'
     Assert ($ui.Selected.Count -eq 3) 'A selects all eligible projects from partial selection'
@@ -318,7 +320,7 @@ c.close()
     $script:keys.Enqueue('Escape')
     [void](Invoke-ProjectPicker $ui)
     Assert (@($script:screen | Where-Object Length -ge 80).Count -eq 0 -and $script:screen.Count -lt 24) 'Project picker fits an 80x24 terminal with controls visible'
-    Assert (($script:screen -join "`n") -match 'Enter review cleanup' -and ($script:screen -join "`n") -match 'Esc quit') 'Narrow terminal keeps review and exit controls visible'
+    Assert (($script:screen -join "`n") -match 'Enter review cleanup' -and ($script:screen -join "`n") -match 'Esc/Ctrl\+C twice quit') 'Narrow terminal keeps review and exit controls visible'
     $longLabel = 'D:\ACollectionOfDevelopedSystems\ActiveDevelopment\a-very-long-project-name'
     $shortLabel = Format-ProjectLabel $longLabel 50
     Assert ($shortLabel.Length -eq 50 -and $shortLabel.EndsWith('a-very-long-project-name')) 'Clipped paths retain the identifying project name'
@@ -336,6 +338,8 @@ c.close()
     }
     function Invoke-ProjectPicker { param($Session) $script:capturedSession = $Session; return 'Back' }
     function Invoke-InventoryUI { param($Session) $script:capturedSession = $Session; return 'Back' }
+    $script:homeMenuCount = 0
+    function Show-StartMenu { $script:homeMenuCount++; return @() }
     Invoke-AgentPurge @('clean', '--all')
     Assert ($script:capturedSession.Selected.Count -eq 3 -and -not $script:capturedSession.Advanced) 'Clean-all preselects only eligible items in standard mode'
     Invoke-AgentPurge @('clean', '--all', '--advanced')
@@ -346,6 +350,7 @@ c.close()
     Assert ($script:capturedSession.ProjectPath -eq $project -and $script:scanRequests[-1].ProjectPath -eq $project) 'Project cleanup preserves its scan scope for refresh'
     Invoke-AgentPurge @('scan', '--global')
     Assert ($script:capturedSession.Selected.Count -eq 0) 'Scan never preselects items'
+    Assert ($script:homeMenuCount -eq 5) 'Back from direct commands returns to home instead of quitting'
     $script:explicitUpdateRequests = 0
     function Update-AgentPurge { $script:explicitUpdateRequests++ }
     Invoke-AgentPurge @('update')
@@ -357,9 +362,8 @@ c.close()
         Assert $rejected ('Reject unsupported or conflicting arguments: ' + ($invalid -join ' '))
     }
     Assert ($script:scanRequests.Count -eq $requestCount) 'Invalid commands fail before scanning'
-    foreach ($key in @('Enter', 'Escape')) { $script:keys.Enqueue($key) }
     Invoke-AgentPurge @()
-    Assert ($script:keys.Count -eq 0) 'Back from selection returns to the home menu'
+    Assert ($script:homeMenuCount -eq 6) 'Empty command opens the home menu'
     function Test-InteractiveTerminal { return $false }
     $script:capturedSession = $null
     $readOnly = (Invoke-AgentPurge @('clean', '--all')) -join "`n"

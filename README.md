@@ -116,13 +116,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 clean
 | --- | --- |
 | Up / Down | Move through projects, providers, categories, or items. |
 | Enter | Review selected cleanup in the project checklist; open a row in the inspector. |
-| B / Backspace / Left | Go back, preserving selection and the inspector's previous cursor. At the top level, return to the main menu if launched there; otherwise exit. |
+| B / Backspace | Go back, preserving selection. From a top-level view, return to the main menu. |
+| Left | Go back one level in the inspector; stays in the project checklist. |
 | Space | Select or deselect eligible items in the focused project, provider, category, or item. |
 | A | Select all eligible items in the current view; press again to clear them. |
 | I / Right | Inspect the focused project or shared-storage group. |
 | C | Copy a session's resume command from its detail view. |
 | D | Review selected items and cleanup methods. |
-| Esc | Exit without further changes. |
+| Esc / Ctrl+C twice | Exit without further changes. One Ctrl+C waits for another key; any other key continues. |
 
 `[ ]` means eligible but unselected, `[x]` means all eligible items selected, `[~]` means partly selected, and `[-]` means inspection only. Protected items are excluded from group selection and select-all. An item detail shows provider, recorded project, category, session date, logical size, exact path, title and its source, resume command, and eligibility. A stored title is labeled **stored**; a title taken from a first prompt is labeled **derived from first prompt**. Missing metadata leaves a session visible for inspection but not deletion.
 
