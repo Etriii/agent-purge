@@ -834,14 +834,15 @@ function Invoke-InventoryUI($Session, [string]$GroupKey = '') {
 
 function Install-AgentPurge {
     param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
-        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
+        [ValidateSet('User', 'Process')][string]$PathScope = 'User',
+        [string]$SourceFile = $script:AgentPurgeScript)
     $root = Get-FullPath $InstallRoot
     $scriptFile = Join-Path $root 'agent-purge.ps1'
     $launcher = Join-Path $root 'agent-purge.cmd'
     $marker = Join-Path $root 'install.json'
     if ((Test-Path -LiteralPath $root) -and -not (Test-Path -LiteralPath $marker)) { throw "Install directory already exists without an agent-purge marker: $root" }
     if (-not (Test-Path -LiteralPath $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
-    if ((Get-FullPath $script:AgentPurgeScript) -ne $scriptFile) { Copy-Item -LiteralPath $script:AgentPurgeScript -Destination $scriptFile -Force }
+    if ((Get-FullPath $SourceFile) -ne $scriptFile) { Copy-Item -LiteralPath $SourceFile -Destination $scriptFile -Force }
     $body = "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0agent-purge.ps1`" %*`r`n"
     [IO.File]::WriteAllText($launcher, $body, [Text.Encoding]::ASCII)
     $record = [ordered]@{ name = 'agent-purge'; scriptHash = (Get-FileHash -LiteralPath $scriptFile -Algorithm SHA256).Hash; launcherHash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash }
@@ -853,6 +854,46 @@ function Install-AgentPurge {
     }
     Write-Host "Installed at $root"
     if ($PathScope -eq 'User') { Write-Host 'Open a new terminal to use agent-purge.' }
+}
+
+function Invoke-StartupUpdateCheck {
+    param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
+        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
+    $root = Get-FullPath $InstallRoot
+    $scriptFile = Join-Path $root 'agent-purge.ps1'
+    if (-not (Test-InteractiveTerminal) -or (Get-FullPath $script:AgentPurgeScript) -ne $scriptFile) { return $false }
+    $download = Join-Path $env:TEMP ('agent-purge-update-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    try {
+        $marker = Join-Path $root 'install.json'
+        $launcher = Join-Path $root 'agent-purge.cmd'
+        $record = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($record.name -ne 'agent-purge' -or -not $record.scriptHash -or -not $record.launcherHash) { throw 'Invalid installation marker' }
+        foreach ($pair in @(@($scriptFile, $record.scriptHash), @($launcher, $record.launcherHash))) {
+            if (-not (Test-Path -LiteralPath $pair[0]) -or (Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ne $pair[1]) {
+                throw 'Installed files have changed'
+            }
+        }
+        Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/Etriii/agent-purge/main/agent-purge.ps1' -OutFile $download -TimeoutSec 5 -ErrorAction Stop | Out-Null
+        if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -eq $record.scriptHash) { return $false }
+        $tokens = $null; $parseErrors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($download, [ref]$tokens, [ref]$parseErrors)
+        if ($parseErrors.Count) { throw 'Downloaded update has invalid PowerShell syntax' }
+        Write-Host 'The published Agent Purge script on GitHub main differs from this installation.'
+        Write-Host 'U install published version | S skip and continue'
+        while ($true) {
+            $choice = Read-MenuKey
+            if ($choice -in @('S', 'Escape')) { return $false }
+            if ($choice -eq 'U') { break }
+        }
+        Install-AgentPurge -InstallRoot $root -PathScope $PathScope -SourceFile $download | Out-Null
+        Write-Host 'Update installed. Start agent-purge again to use the new version.'
+        return $true
+    } catch {
+        Write-Host ('Update check failed: {0}. Continuing with the installed version.' -f $_.Exception.Message) -ForegroundColor Yellow
+        return $false
+    } finally {
+        if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force }
+    }
 }
 
 function Uninstall-AgentPurge {
@@ -881,7 +922,7 @@ function Show-AgentPurgeHelp {
 Agent Purge: inspect and selectively clean local Codex and Claude storage.
 
 Usage:
-  agent-purge                       Guided menu with explanations and back navigation
+  agent-purge                       Check for updates, then open the guided menu
   agent-purge clean                 Choose projects with Space, then Enter to review
   agent-purge clean --all           Preselect all eligible storage; review before deletion
   agent-purge clean --all --advanced
@@ -901,7 +942,8 @@ B/Backspace goes back; Esc quits. [x] selected, [~] partial, [-] inspect only.
 Sizes show inventoried agent storage by project/provider/category, not source folders.
 Clean --all never removes protected items and still requires typed confirmation.
 Redirected scan and clean commands only print inventory; they never remove data.
-To update: pull the latest main branch in your Git checkout and run install again.
+Installed interactive launches offer an update from GitHub main when available.
+To update a source checkout: pull main and run install again.
 '@ | Write-Output
 }
 
@@ -961,6 +1003,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
     if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core' -and $env:OS -ne 'Windows_NT') { throw 'Agent Purge requires Windows.' }
     $fromMenu = -not $Arguments.Count
     if ($fromMenu -and -not (Test-InteractiveTerminal)) { Show-AgentPurgeHelp; return }
+    if ($fromMenu -and (Invoke-StartupUpdateCheck)) { return }
     do {
         if ($fromMenu) { $Arguments = @(Show-StartMenu); if (-not $Arguments.Count) { return } }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq '--help') { Show-AgentPurgeHelp; return }
@@ -977,6 +1020,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
             if (-not (Test-Path -LiteralPath $Arguments[2] -PathType Container)) { throw "Project directory not found: $($Arguments[2])" }
             $project = (Get-Item -LiteralPath $Arguments[2]).FullName
         } else { throw 'Invalid arguments. Use --help.' }
+        if (-not $fromMenu -and (Invoke-StartupUpdateCheck)) { return }
         $context = New-AgentPurgeContext
         $items = @(Get-ScanInventory $context $advanced $project)
         if (-not (Test-InteractiveTerminal)) {

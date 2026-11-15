@@ -203,6 +203,50 @@ c.close()
         Assert ((Get-Content -LiteralPath (Join-Path $installRoot 'agent-purge.ps1') -Raw) -match 'update fixture') 'Update replaces installed script'
         $pathEntries = @([Environment]::GetEnvironmentVariable('Path', 'Process') -split ';' | Where-Object { $_ -eq $installRoot })
         Assert ($pathEntries.Count -eq 1) 'Update keeps one PATH entry'
+        $installedScript = Join-Path $installRoot 'agent-purge.ps1'
+        $script:AgentPurgeScript = $installedScript
+        $script:updateSource = $updatedSource
+        $script:updateRequests = 0
+        $script:updateKeys = New-Object 'System.Collections.Generic.Queue[string]'
+        function Test-InteractiveTerminal { return $true }
+        function Read-MenuKey { return $script:updateKeys.Dequeue() }
+        function Invoke-WebRequest {
+            param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile, [int]$TimeoutSec, $ErrorAction)
+            $script:updateRequests++
+            if ($script:updateSource -eq 'offline') { throw 'Network unavailable' }
+            Copy-Item -LiteralPath $script:updateSource -Destination $OutFile
+        }
+        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Matching remote script needs no update'
+        $remoteUpdate = Join-Path $fixture 'remote-agent-purge.ps1'
+        Set-Content -LiteralPath $remoteUpdate -Value '# newer fixture'
+        $script:updateSource = $remoteUpdate
+        $script:updateKeys.Enqueue('S')
+        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Skip continues without updating'
+        Assert ((Get-Content -LiteralPath $installedScript -Raw) -match 'update fixture') 'Skip preserves installed script'
+        $script:updateKeys.Enqueue('U')
+        Assert (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process) 'Update choice installs downloaded script'
+        $installedHash = (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash
+        $markerHash = (Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json).scriptHash
+        Assert ($installedHash -eq $markerHash -and $installedHash -eq (Get-FileHash -LiteralPath $remoteUpdate -Algorithm SHA256).Hash) 'Update refreshes script and install marker'
+        $invalidUpdate = Join-Path $fixture 'invalid-agent-purge.ps1'
+        Set-Content -LiteralPath $invalidUpdate -Value '{'
+        $script:updateSource = $invalidUpdate
+        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Invalid downloaded script is rejected'
+        Assert ((Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Invalid update preserves installed script'
+        $script:updateSource = 'offline'
+        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Network failure continues with installed version'
+        Assert ((Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Network failure preserves installed script'
+        $requests = $script:updateRequests
+        Add-Content -LiteralPath $installedScript -Value '# local edit'
+        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Changed installed script is not overwritten'
+        Assert ($script:updateRequests -eq $requests) 'Changed installed script is checked before download'
+        Copy-Item -LiteralPath $remoteUpdate -Destination $installedScript -Force
+        function Test-InteractiveTerminal { return $false }
+        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Redirected input skips update check'
+        $script:AgentPurgeScript = $originalSource
+        function Test-InteractiveTerminal { return $true }
+        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Source checkout skips installed update check'
+        Assert ($script:updateRequests -eq $requests) 'Skipped checks do not contact GitHub'
         Uninstall-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
         Assert (-not (Test-Path $installRoot)) 'Uninstall files'
         Assert (-not ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot))) 'Uninstall PATH'

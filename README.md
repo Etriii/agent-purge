@@ -14,6 +14,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 instal
 
 Open a new terminal, then run `agent-purge --help`. A private repository requires GitHub access configured for Git on this machine.
 
+Each interactive launch of the installed `agent-purge` checks the published `main` script on GitHub. If it differs from the installed copy, press **U** to install it or **S** to skip and continue. **U** replaces the installed copy with published `main`, including when the current copy came from newer unpublished local work. After updating, run `agent-purge` again to use the new version. If GitHub cannot be reached, the installed version continues to work. The check does not run for redirected input, `--help`, `install`, `uninstall`, or when running a source checkout directly.
+
 To update, pull the latest `main` branch in the same checkout and run `install` again:
 
 ```powershell
@@ -22,7 +24,7 @@ git pull --ff-only origin main
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 install
 ```
 
-`install` replaces the installed script and launcher and does not add a duplicate PATH entry. If `git pull` fails, stop and resolve that before running `install`.
+`install` replaces the installed script and launcher and does not add a duplicate PATH entry. If `git pull` fails, stop and resolve that before running `install`. Manual updates also work when you want to update the checkout itself.
 
 For a public repository, Git is optional. Download the script from the `main` branch with PowerShell, then run `install`; repeat these commands to update:
 
