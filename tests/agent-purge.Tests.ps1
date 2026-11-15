@@ -167,32 +167,37 @@ c.close()
     Set-Content -LiteralPath $confirmFile -Value 'confirmation'
     $confirmLog = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $confirmFile '' '' '' '' '' '' $true
     $script:answers = New-Object 'System.Collections.Generic.Queue[string]'
+    $script:keys = New-Object 'System.Collections.Generic.Queue[string]'
     $script:deletedIds = @()
     function Read-Host { param([string]$Prompt) return $script:answers.Dequeue() }
+    function Read-MenuKey { if (-not $script:keys.Count) { throw 'Unexpected cleanup key prompt' }; return $script:keys.Dequeue() }
     function Test-AppClosed { param([string]$Provider) return $true }
     function Invoke-CodexDeletion { param([string]$Id) $script:deletedIds += $Id }
-    foreach ($reviewAnswers in @(@('B'), @('p', 'P', 'B'), @('P', 'delete files', 'B'), @('P', 'DELETE FILES', 'B'))) {
-        foreach ($answer in $reviewAnswers) { $script:answers.Enqueue($answer) }
+    foreach ($key in @('Enter', 'Enter', 'Enter')) { $script:keys.Enqueue($key) }
+    Invoke-Cleanup @($confirmLog) $ctx | Out-Null
+    Assert ((Test-Path $confirmFile) -and $script:keys.Count -eq 0) 'Enter on the default file confirmation cancels cleanup'
+    foreach ($key in @('Enter', 'DownArrow', 'DownArrow', 'Enter', 'Enter')) { $script:keys.Enqueue($key) }
+    Invoke-Cleanup @($confirmLog) $ctx | Out-Null
+    Assert ((Test-Path $confirmFile) -and $script:keys.Count -eq 0) 'Permanent file warning defaults to cancel'
+    foreach ($reviewKeys in @(
+        @('B'),
+        @('Enter', 'B'),
+        @('Enter', 'DownArrow', 'DownArrow', 'Enter', 'DownArrow', 'Spacebar', 'B'),
+        @('Enter', 'DownArrow', 'DownArrow', 'Enter', 'DownArrow', 'Spacebar', 'DownArrow', 'Enter', 'B')
+    )) {
+        foreach ($key in $reviewKeys) { $script:keys.Enqueue($key) }
         Invoke-Cleanup @($confirmLog, ($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
         Assert ((Test-Path $confirmFile) -and $script:deletedIds.Count -eq 0) 'Back at any review prompt must leave both batches intact'
-        Assert ($script:answers.Count -eq 0) 'Back consumes only the current review prompts'
+        Assert ($script:keys.Count -eq 0) 'Back consumes only the current review keys'
     }
-    $script:answers.Enqueue('C')
-    $script:answers.Enqueue('cancel')
-    $script:answers.Enqueue('C')
+    foreach ($key in @('Enter', 'DownArrow', 'DownArrow', 'DownArrow', 'Enter', 'Enter')) { $script:keys.Enqueue($key) }
     Invoke-Cleanup @($confirmLog, ($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
     Assert ((Test-Path $confirmFile) -and $script:deletedIds.Count -eq 0) 'Cancellation leaves both batches intact'
-    $script:answers.Enqueue('P')
-    $script:answers.Enqueue('M')
-    $script:answers.Enqueue('P')
-    $script:answers.Enqueue('delete files')
-    $script:answers.Enqueue('DELETE FILES')
-    $script:answers.Enqueue('cancel')
-    $script:answers.Enqueue('C')
+    foreach ($key in @('Enter', 'DownArrow', 'DownArrow', 'Enter', 'DownArrow', 'Spacebar', 'DownArrow', 'Enter', 'Enter')) { $script:keys.Enqueue($key) }
     Invoke-Cleanup @($confirmLog, ($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
     Assert (-not (Test-Path $confirmFile)) 'Confirmed file batch removed'
     Assert ($script:deletedIds.Count -eq 0) 'File confirmation does not authorize Codex'
-    $script:answers.Enqueue('DELETE CODEX')
+    foreach ($key in @('Enter', 'DownArrow', 'Spacebar', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
     Invoke-Cleanup @(($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
     Assert ($script:deletedIds.Count -eq 1 -and $script:deletedIds[0] -eq $cid) 'Separate Codex confirmation'
     $undoFile = Join-Path $claudeRoot 'debug\undo.txt'
@@ -202,13 +207,13 @@ c.close()
     Set-Content -LiteralPath (Join-Path $undoCache 'child.txt') -Value 'cache content'
     $undoLogItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $undoFile '' '' '' '' '' '' $true
     $undoCacheItem = New-InventoryItem $ctx 'Claude' 'Caches' 'Cache' $undoCache '' '' '' '' '' '' $true
-    foreach ($answer in @('u', 'U', 'move to undo', 'MOVE TO UNDO')) { $script:answers.Enqueue($answer) }
+    foreach ($key in @('Enter', 'Enter', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
     Invoke-Cleanup @($undoLogItem, $undoCacheItem) $ctx $true | Out-Null
     $undoRoot = Join-Path $fixture '.agent-purge-undo'
     $manifestFile = @(Get-ChildItem -LiteralPath (Join-Path $undoRoot 'runs') -Filter '*.json')[0].FullName
     $run = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
     Assert (-not (Test-Path $undoFile) -and -not (Test-Path $undoCache) -and $run.Entries.Count -eq 2) 'Undo run archives selected file and directory only'
-    Assert ($script:answers.Count -eq 0 -and $run.Hash -eq (Get-UndoHash $run)) 'Undo confirmation is case sensitive and manifest hash matches'
+    Assert ($script:keys.Count -eq 0 -and $run.Hash -eq (Get-UndoHash $run)) 'Keyboard confirmation creates a matching undo manifest'
     $badHashRejected = $false
     try { Invoke-UndoRestore $ctx $run.RunId ('0' * 64) | Out-Null } catch { $badHashRejected = $true }
     Assert $badHashRejected 'Incorrect restore hash is rejected before moving files'
@@ -228,9 +233,9 @@ c.close()
     $recycleConfirmFile = Join-Path $claudeRoot 'debug\recycle-confirm.txt'
     Set-Content -LiteralPath $recycleConfirmFile -Value 'recycle content'
     $recycleConfirmItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $recycleConfirmFile '' '' '' '' '' '' $true
-    foreach ($answer in @('R', 'MOVE TO RECYCLE BIN')) { $script:answers.Enqueue($answer) }
+    foreach ($key in @('Enter', 'Enter', 'DownArrow', 'DownArrow', 'Enter', 'DownArrow', 'Enter', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
     Invoke-Cleanup @($recycleConfirmItem) $ctx | Out-Null
-    Assert (-not (Test-Path $recycleConfirmFile)) 'Recycle Bin batch uses its exact confirmation phrase'
+    Assert (-not (Test-Path $recycleConfirmFile)) 'File method changes without restarting review and Recycle Bin uses keyboard confirmation'
     $installRoot = Join-Path $fixture 'install'
     $oldPath = [Environment]::GetEnvironmentVariable('Path', 'Process')
     $originalSource = $script:AgentPurgeScript
@@ -322,9 +327,8 @@ c.close()
     function Write-Host { param([object]$Object, $ForegroundColor) $script:screen.Add([string]$Object) }
     function Test-InteractiveTerminal { return $true }
     $ui = [pscustomobject]@{Items=$all;Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
-    foreach ($key in @('Spacebar', 'I', 'Enter', 'Enter', 'Enter', 'B', 'B', 'B', 'B', 'Enter', 'B')) { $script:keys.Enqueue($key) }
-    # The largest fixture project has a Codex session; cancel its review and return.
-    $script:answers.Enqueue('B')
+    foreach ($key in @('Spacebar', 'I', 'Enter', 'Enter', 'Enter', 'B', 'B', 'B', 'B', 'Enter', 'B', 'B')) { $script:keys.Enqueue($key) }
+    # The largest fixture project has a Codex session; leave its review and return.
     Assert ((Invoke-ProjectPicker $ui) -eq 'Back') 'Project picker supports inspect, nested back, review, and back to home'
     Assert ($ui.Selected.Count -eq 1) 'Selection persists through nested inspector and cancelled review'
     Assert ($script:screen -match 'Which projects' -and $script:screen -match 'Selected:' -and $script:screen -match '100%') 'Picker shows context, selected size, and distributions'
@@ -352,7 +356,7 @@ c.close()
     $refreshItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $refreshFile '' '' '' '' '' '' $true
     $refreshUI = [pscustomobject]@{Items=@($refreshItem);Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
     $refreshUI.Selected[$refreshItem.Key] = $true
-    $script:answers.Enqueue('P'); $script:answers.Enqueue('DELETE FILES'); $script:keys.Enqueue('Enter')
+    foreach ($key in @('Enter', 'DownArrow', 'DownArrow', 'Enter', 'DownArrow', 'Spacebar', 'DownArrow', 'Enter', 'Enter')) { $script:keys.Enqueue($key) }
     Invoke-SelectionCleanup $refreshUI
     Assert (-not (Test-Path -LiteralPath $refreshFile) -and $refreshUI.Selected.Count -eq 0) 'Cleanup refresh drops removed selections'
     Assert ($refreshFile -notin $refreshUI.Items.Path -and $claudeFile -in $refreshUI.Items.Path) 'Refresh measures remaining inventory without deleting unselected history'
@@ -413,7 +417,7 @@ c.close()
     $readOnly = (Invoke-AgentPurge @('clean', '--all')) -join "`n"
     Assert ($null -eq $script:capturedSession -and $readOnly -match 'Read-only inventory' -and $readOnly -match 'By project' -and $readOnly -match 'incomplete') 'Redirected clean-all only prints inventory including incomplete-size context'
     Assert ($script:deletedIds.Count -eq 1 -and (Test-Path -LiteralPath $claudeFile)) 'UI and command tests never delete provider sessions'
-    Write-Output 'PASS: fixtures, sizes, project selection, keyboard flows, case-sensitive cleanup, undo restore, command dispatch, install/update/uninstall.'
+    Write-Output 'PASS: fixtures, sizes, project selection, keyboard-only cleanup, undo restore, command dispatch, install/update/uninstall.'
 } finally {
     $full = Get-FullPath $fixture
     $tempRoot = Get-FullPath $env:TEMP

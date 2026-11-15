@@ -648,70 +648,97 @@ function Invoke-CodexDeletion([string]$Id) {
     if ($LASTEXITCODE -ne 0) { throw "codex delete exited $LASTEXITCODE" }
 }
 
+function Read-CleanupChoice([string]$Heading, $Items, [string[]]$Options, [int]$DefaultIndex = 0, [string]$Description = '') {
+    $paths = @($Items | ForEach-Object {
+        if ($_.Kind -eq 'CodexSession') { 'codex delete {0} | {1}' -f $_.Id, $_.Path }
+        else { Get-ItemPaths $_ }
+    })
+    $summary = Get-InventorySummary $Items
+    $index = $DefaultIndex; $page = 0
+    while ($true) {
+        $pageSize = Get-PageSize (9 + $Options.Count)
+        $pages = [math]::Max(1, [int][math]::Ceiling($paths.Count / $pageSize))
+        $page = [math]::Min($page, $pages - 1)
+        $start = $page * $pageSize
+        $end = [math]::Min($paths.Count, $start + $pageSize)
+        Clear-Host
+        Write-ScreenLine ('AGENT PURGE / ' + $Heading) Cyan
+        Write-ScreenLine ('Selected: {0} items | {1} estimated logical size' -f $summary.Count, (Format-Bytes $summary.Bytes)) Cyan
+        if ($Description) { Write-ScreenLine $Description Yellow }
+        Write-ScreenLine ('Exact paths {0}-{1}/{2} | PgUp/PgDn browse | I show full paths' -f ($start + [int]($paths.Count -gt 0)), $end, $paths.Count) DarkGray
+        for ($i = $start; $i -lt $end; $i++) { Write-ScreenLine ('  ' + $paths[$i]) }
+        Write-ScreenLine ''
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            Write-ScreenLine ('{0} {1}' -f $(if ($i -eq $index) { '>' } else { ' ' }), $Options[$i]) $(if ($i -eq $index) { 'White' } else { 'Gray' })
+        }
+        Write-ScreenLine 'Up/Down choose | Enter/Space select | B back | Esc/Ctrl+C twice quit'
+        $key = Read-MenuKey
+        switch ($key) {
+            'Escape' { return 'Exit' }
+            { $_ -in @('B', 'Backspace') } { return 'Back' }
+            'UpArrow' { $index = ($index + $Options.Count - 1) % $Options.Count }
+            'DownArrow' { $index = ($index + 1) % $Options.Count }
+            'PageUp' { $page = [math]::Max(0, $page - 1) }
+            'PageDown' { $page = [math]::Min($pages - 1, $page + 1) }
+            'I' {
+                Clear-Host
+                Write-Host ("Exact selected paths $($start + 1)-$end/$($paths.Count):")
+                for ($i = $start; $i -lt $end; $i++) { Write-Host $paths[$i] }
+                Write-Host 'Press any key to return to choices.'
+                if ((Read-MenuKey) -eq 'Escape') { return 'Exit' }
+            }
+            { $_ -in @('Enter', 'Spacebar') } { return $Options[$index] }
+        }
+    }
+}
+
 function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
     $selected = @($Items | Where-Object Eligible)
     if (-not $selected.Count) { Write-Host 'Nothing selected.'; return }
     $files = @($selected | Where-Object Kind -ne 'CodexSession')
     $codex = @($selected | Where-Object Kind -eq 'CodexSession')
-    $summary = Get-InventorySummary $selected
-    Write-Host "`nREVIEW CLEANUP"
-    Write-Host ('{0} selected items | {1} estimated logical size' -f $summary.Count, (Format-Bytes $summary.Bytes))
-    foreach ($group in (Get-ProjectGroups $selected)) {
-        Write-Host ('  {0} | {1} | {2} items' -f $group.Label, (Format-Bytes $group.Summary.Bytes), $group.Summary.Count)
-    }
-    Write-Host 'Close the relevant provider apps before proceeding. Source-project files are not cleanup targets.'
-    Write-Host 'Review both methods below. Nothing is removed until all prompts are finished.'
-    Write-Host 'Choices and confirmation phrases are case sensitive. Use uppercase letters exactly as shown.'
-    Write-Host 'B = back to selection without deleting anything. C = skip the current batch.'
+    $review = Read-CleanupChoice 'REVIEW SELECTION' $selected @('Continue to cleanup methods', 'Back to selection') 0 'Review every exact path before choosing a method. No files have moved.'
+    if ($review -eq 'Exit') { return 'Exit' }
+    if ($review -ne 'Continue to cleanup methods') { return }
     $confirmFiles = $false; $confirmCodex = $false
     $preview = @{}
     $before = Get-FreeSpace $selected
     if ($files.Count) {
-        Write-Host "`nFile cleanup: $($files.Count) items"
-        Write-Host 'Undo folder allows a run-based restore, but keeps using disk space until removed manually.'
-        Write-Host 'Recycle Bin allows manual recovery until emptied; it may not free disk space immediately.'
-        Write-Host 'Permanent removal cannot be undone through the Recycle Bin.'
         while ($true) {
-            do {
-                $choice = (Read-Host 'Method: U = Undo folder (recommended), R = Recycle Bin, P = permanent, C = skip, B = back (case sensitive)').Trim()
-                if ($choice -cnotin @('U', 'R', 'P', 'C', 'B')) { Write-Host 'Use an uppercase choice exactly as shown.' -ForegroundColor Yellow }
-            } while ($choice -cnotin @('U', 'R', 'P', 'C', 'B'))
-            if ($choice -ceq 'B') { return }
-            if ($choice -ceq 'C') { Write-Host 'File cleanup skipped.'; break }
-            $method = if ($choice -ceq 'U') { 'Undo folder' } elseif ($choice -ceq 'R') { 'Recycle Bin' } else { 'Permanent' }
-            [long]$bytes = 0
+            $choice = Read-CleanupChoice 'CHOOSE FILE METHOD' $files @('Undo folder (recommended)', 'Recycle Bin', 'Permanent', 'Skip file batch', 'Back to selection') 0 'Undo keeps disk space; Recycle Bin is manual recovery; Permanent cannot be restored.'
+            if ($choice -eq 'Exit') { return 'Exit' }
+            if ($choice -in @('Back', 'Back to selection')) { return }
+            if ($choice -eq 'Skip file batch') { break }
+            $method = if ($choice -eq 'Undo folder (recommended)') { 'Undo folder' } else { $choice }
             foreach ($item in $files) {
-                $bytes += $item.Bytes
                 $preview[$item.Key] = @(Get-ItemPaths $item)
-                foreach ($path in $preview[$item.Key]) { Write-Host ("  {0} | {1}" -f $method, $path) }
             }
-            Write-Host ("Selected for {0}: {1} items, {2} estimated logical size." -f $method, $files.Count, (Format-Bytes $bytes))
-            $phrase = if ($method -eq 'Undo folder') { 'MOVE TO UNDO' } elseif ($method -eq 'Recycle Bin') { 'MOVE TO RECYCLE BIN' } else { 'DELETE FILES' }
-            Write-Host ("Confirmed items will {0}." -f $(if ($method -eq 'Permanent') { 'be removed permanently' } else { 'move to the ' + $method }))
-            do {
-                $answer = Read-Host "Type $phrase to confirm, M to change method, C to skip, B to go back (case sensitive)"
-                if ($answer -cnotin @($phrase, 'M', 'C', 'B')) { Write-Host 'No action taken. Enter the exact uppercase phrase or choice shown.' -ForegroundColor Yellow }
-            } while ($answer -cnotin @($phrase, 'M', 'C', 'B'))
-            if ($answer -ceq 'B') { return }
-            if ($answer -ceq 'M') { continue }
-            $confirmFiles = $answer -ceq $phrase
-            if (-not $confirmFiles) { Write-Host 'File cleanup skipped.' }
+            if ($method -eq 'Permanent') {
+                $ack = Read-CleanupChoice 'PERMANENT FILE WARNING' $files @('Cancel file batch', 'I understand these files cannot be restored', 'Change file method') 0 'Permanent removal has no restore command or Recycle Bin recovery.'
+                if ($ack -eq 'Exit') { return 'Exit' }
+                if ($ack -eq 'Back') { return }
+                if ($ack -eq 'Change file method') { continue }
+                if ($ack -ne 'I understand these files cannot be restored') { break }
+            }
+            $action = if ($method -eq 'Undo folder') { 'Move to undo folder' } elseif ($method -eq 'Recycle Bin') { 'Move to Recycle Bin' } else { 'Delete files permanently' }
+            $answer = Read-CleanupChoice 'CONFIRM FILE CLEANUP' $files @('Cancel file batch', $action, 'Change file method') 0 ("Selected action: $action. Cancel is the default; Enter/Space on the action confirms.")
+            if ($answer -eq 'Exit') { return 'Exit' }
+            if ($answer -eq 'Back') { return }
+            if ($answer -eq 'Change file method') { continue }
+            $confirmFiles = $answer -eq $action
             break
         }
     }
     if ($codex.Count) {
-        Write-Host "`nCodex sessions: $($codex.Count) permanent deletions via codex delete"
-        [long]$bytes = 0
-        foreach ($item in $codex) { $bytes += $item.Bytes; Write-Host ("  codex delete {0} | {1}" -f $item.Id, $item.Path) }
-        Write-Host ("Selected for permanent codex delete: {0} items, {1} estimated logical size." -f $codex.Count, (Format-Bytes $bytes))
-        Write-Host 'Codex uses its own deletion command to update session records. These sessions cannot use the undo folder or Recycle Bin.'
-        do {
-            $answer = Read-Host 'Type DELETE CODEX to confirm, C to skip this batch, B to go back (case sensitive)'
-            if ($answer -cnotin @('DELETE CODEX', 'C', 'B')) { Write-Host 'No action taken. Enter the exact uppercase phrase or choice shown.' -ForegroundColor Yellow }
-        } while ($answer -cnotin @('DELETE CODEX', 'C', 'B'))
-        if ($answer -ceq 'B') { return }
-        $confirmCodex = $answer -ceq 'DELETE CODEX'
-        if (-not $confirmCodex) { Write-Host 'Codex cleanup skipped.' }
+        $ack = Read-CleanupChoice 'PERMANENT CODEX WARNING' $codex @('Cancel Codex batch', 'I understand Codex sessions cannot be restored') 0 'Codex delete changes provider records; the undo folder and Recycle Bin cannot restore it.'
+        if ($ack -eq 'Exit') { return 'Exit' }
+        if ($ack -eq 'Back') { return }
+        if ($ack -eq 'I understand Codex sessions cannot be restored') {
+            $answer = Read-CleanupChoice 'CONFIRM CODEX DELETION' $codex @('Cancel Codex batch', 'Delete Codex sessions permanently') 0 'Cancel is the default. Only the focused permanent action authorizes Codex deletion.'
+            if ($answer -eq 'Exit') { return 'Exit' }
+            if ($answer -eq 'Back') { return }
+            $confirmCodex = $answer -eq 'Delete Codex sessions permanently'
+        }
     }
     if (-not $confirmFiles -and -not $confirmCodex) { return }
     $undoRun = $null; $undoPaths = @{}
@@ -832,6 +859,7 @@ function Invoke-SelectionCleanup($Session) {
     if (-not $selectedItems.Count) { return }
     Clear-Host
     $attempted = Invoke-Cleanup $selectedItems $Session.Context $Session.Advanced
+    if ($attempted -is [string] -and $attempted -ceq 'Exit') { return 'Exit' }
     if ($attempted) {
         $Session.Items = @(Get-ScanInventory $Session.Context $Session.Advanced $Session.ProjectPath)
         $remaining = @{}
@@ -900,7 +928,9 @@ function Invoke-ProjectPicker($Session) {
                 if ($groups.Count -and (Invoke-InventoryUI $Session $groups[$index].Key) -eq 'Exit') { return 'Exit' }
             }
             { $_ -in @('Enter', 'D') } {
-                if (@(Get-SelectedItems $Session.Items $Session.Selected).Count) { Invoke-SelectionCleanup $Session }
+                if (@(Get-SelectedItems $Session.Items $Session.Selected).Count) {
+                    if ((Invoke-SelectionCleanup $Session) -eq 'Exit') { return 'Exit' }
+                }
                 else { $notice = 'Nothing selected. Use Space on a project, or A to select all eligible items.' }
             }
         }
@@ -969,7 +999,7 @@ function Invoke-InventoryUI($Session, [string]$GroupKey = '') {
         $key = Read-MenuKey
         if ($key -eq 'Escape') { return 'Exit' }
         if ($key -in @('B', 'Backspace') -and $state.Level -eq 0) { return 'Back' }
-        if ($key -eq 'D') { Invoke-SelectionCleanup $Session; continue }
+        if ($key -eq 'D') { if ((Invoke-SelectionCleanup $Session) -eq 'Exit') { return 'Exit' }; continue }
         if ($key -eq 'Spacebar') { Switch-ItemSelection $focusedItems $selected; continue }
         if ($key -eq 'A') {
             $viewItems = switch ($state.Level) {
@@ -1113,11 +1143,11 @@ Project picker: Up/Down move, Space toggle, A select/clear all, Enter review,
 I inspect. Inspector: Enter open, D review, C copy resume from details.
 B/Backspace goes back; Esc or Ctrl+C twice quits. [x] selected, [~] partial, [-] inspect only.
 Undo folder keeps files for run-based restore; Recycle Bin needs manual restore.
-At file cleanup: U undo folder, R Recycle Bin, P permanent, C skip, B back.
+At file cleanup: Up/Down choose; Enter/Space select. PgUp/PgDn browse paths; I shows full paths.
 Codex sessions use separate permanent deletion and cannot be restored by this command.
-Cleanup letters and confirmation phrases are case sensitive.
+Permanent deletion requires an acknowledgement and a final confirmation; Cancel is the default.
 Sizes show inventoried agent storage by project/provider/category, not source folders.
-Clean --all never removes protected items and still requires typed confirmation.
+Clean --all never removes protected items and still requires an explicit keyboard confirmation.
 Redirected scan and clean commands only print inventory; they never remove data.
 Installed interactive launches offer an update from GitHub main when available.
 Update refreshes the installed copy; to update a source checkout, pull main.
