@@ -14,15 +14,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 instal
 
 Open a new terminal, then run `agent-purge --help`. A private repository requires GitHub access configured for Git on this machine.
 
-To update the installed command from published `main`, run:
+To check for a newer published version on `main`, run:
 
 ```powershell
 agent-purge update
 ```
 
-This works without an interactive terminal. It verifies the installed files and downloaded PowerShell syntax before replacing the installed script. A failed download or check leaves the installed version in place and returns an error. Restart `agent-purge` to use the update. The command does not update a Git checkout or downloaded source file. Published `main` can be older than unpublished local work; `update` installs the published copy.
+This works without an interactive terminal. It verifies the installed files and downloaded PowerShell syntax, then installs the download only when its embedded version is newer than the installed version. An older, equal, or unversioned published script leaves the installed copy intact, even when its hash differs. A failed download or check also leaves the installed version in place. Restart `agent-purge` after an update. The command does not update a Git checkout or downloaded source file. Run `agent-purge --version` to see the installed version.
 
-Launching `agent-purge` does not contact GitHub. Run `agent-purge update` when you want to check and install published `main`. Published `main` can be older than unpublished local work, so this command can replace a locally installed development copy.
+Launching `agent-purge` does not contact GitHub. `update` checks published `main` only when you run it. The embedded version must increase for each published change; republishing changed code with the same version will not update existing installations.
 
 To update a Git checkout as well, pull the latest `main` branch in that checkout and run `install` again:
 
@@ -32,7 +32,7 @@ git pull --ff-only origin main
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 install
 ```
 
-`install` replaces the installed script and launcher and does not add a duplicate PATH entry. If `git pull` fails, stop and resolve that before running `install`. Manual updates also work when you want to update the checkout itself.
+`install` explicitly replaces the installed script and launcher and does not add a duplicate PATH entry. Unlike `update`, manual `install` can replace a newer installed version with an older checkout, so check `--version` first. If `git pull` fails, stop and resolve that before running `install`.
 
 For a public repository, Git is optional. Download the script from the `main` branch with PowerShell, then run `install`; repeat these commands to update:
 
@@ -82,13 +82,14 @@ Uninstall preserves other files in the install directory and refuses to remove a
 | `agent-purge scope ask` or `agent-purge scope reset` | Clear this project's preference so the next interactive run asks again. |
 | `agent-purge install` | Install the user-local launcher and PATH entry. |
 | `agent-purge update` | Update the installed command from published `main`. |
+| `agent-purge --version` | Print the installed script version. |
 | `agent-purge uninstall` | Remove the installed files and PATH entry. |
 | `agent-purge restore <run-id> <hash>` | Restore files saved by one undo-folder cleanup run. |
 | `agent-purge settings` | Change undo retention or location, or clean saved undo data. |
 | `agent-purge settings show` | Display the saved retention and undo location. |
 | `agent-purge settings set retention-days <1-365>` | Set retention for future undo runs. |
 | `agent-purge settings set undo-dir <absolute-path>` | Move existing undo data and store future runs in that folder. |
-| `agent-purge undo clean` | Choose Recycle Bin or permanent removal for the current undo folder. |
+| `agent-purge undo clean` | Inspect, select, and clean saved undo runs. |
 | `agent-purge --help` | Print command and key help. |
 
 Both `scan` and `clean` require an interactive terminal to select or remove items. Redirected input always prints a **read-only** inventory, even with `clean --all`; there is no unattended deletion option. The global scan may take time because it measures logical file sizes. Inaccessible entries are marked **incomplete**, and affected totals are lower bounds.
@@ -103,11 +104,11 @@ Settings, restore, and undo-folder cleanup operate on the user-wide Agent Purge 
 
 ## Settings
 
-Choose **Settings** from the main menu, or run `agent-purge settings`. Use arrows to change the undo retention by one day, PgUp/PgDn by ten days, Home to return to 30 days, and Enter/Space to save. Press **U** to enter an absolute undo folder path, or **C** to clean the current undo folder. B/Backspace leaves without saving. The default retention is 30 days; the allowed range is 1–365. `settings show` prints both saved values.
+Choose **Settings** from the main menu, or run `agent-purge settings`. Use **Up/Down** to focus undo retention, move undo folder, clean undo folder, or **Back to main menu**; **Enter/Space** opens the focused action. On undo retention, **Left/Right** changes the value by one day, **PgUp/PgDn** by ten days, and **Home** resets the draft to 30 days. Enter/Space saves the draft. The screen marks an edited value **unsaved** and shows the saved value separately. The **Move undo folder** action prompts for an absolute path; **Clean undo folder** opens the saved-run browser. **U** and **C** remain shortcuts for those actions. **B/Backspace** leaves without saving an edited retention value. The default retention is 30 days; the allowed range is 1–365. `settings show` prints both saved values.
 
 To use another drive, run `agent-purge settings set undo-dir D:\AgentPurgeUndo`, replacing that path with a new or empty folder you control. Agent Purge copies and verifies existing undo data, switches the saved location, then removes the verified old folders. Existing restore commands keep their original run IDs and hashes. Future undo runs use the new folder; a later location change moves it again. If a copy or check fails before the switch, the previous location remains active and its data stays in place. A failed cleanup after the switch leaves the old folder for inspection. The new folder must not overlap provider storage, the config file, or an existing undo folder.
 
-Run `agent-purge undo clean` to review the exact current folder paths and choose **Recycle Bin**, **Permanent**, or **Keep undo data**. Recycle Bin needs one final confirmation; permanent deletion needs an acknowledgement and a final confirmation. This removes the saved run files and manifests, so `agent-purge restore` can no longer use them. Moving them to the Recycle Bin does not free disk space until the bin is emptied. The saved location setting remains in place for future runs.
+Run `agent-purge undo clean` to browse saved undo runs. Each row shows its logical saved size and the number of stored paths; expired runs are labeled. Press **Enter** or **I** on a run to inspect its original paths and, for an unexpired run, its restore command. Press **Space** to select a run, or **A** to select or clear all eligible runs. The select-all row is above the run list; **Enter** on it selects any remaining runs and proceeds to review. **D** reviews the current selection. Choose **Recycle Bin** or **Permanent**, then confirm. Back and cancel choices appear last. Permanent deletion needs an acknowledgement and final confirmation; the safe default on destructive confirmation screens remains cancel. Cleanup removes only the selected runs' saved payloads and manifests. Other runs, the undo location, and its marker remain. Invalid or unreadable runs are reported and left untouched. Recycled payload folders carry a manifest copy for manual recovery until the Recycle Bin is emptied, but `agent-purge restore` no longer works for removed runs. Moving them to the Recycle Bin does not free disk space until it is emptied.
 
 Settings are stored in `%LOCALAPPDATA%\agent-purge\config.json`. Each new undo run records its creation time and deadline from the current setting; changing the setting does not rewrite existing runs. A missing config uses the default, while an invalid config prevents new undo runs until corrected. The config is user-local and is not removed by `uninstall`.
 
@@ -117,7 +118,7 @@ In global scope, run `agent-purge clean` or choose **Choose projects to clean** 
 
 1. Read the question and storage summary above the checklist. Projects are sorted largest first.
 2. Move with **Up/Down**. The focused project shows item count, eligible size, and size distributions by provider and category, including percentages.
-3. Press **Space** to select or deselect a project's eligible items. **A** selects all eligible items; press it again to clear them. The selected item count and size update as you choose.
+3. The **Select all eligible items** row above the projects selects or clears the full current scope with **Space**. **Enter** selects any remaining eligible items and proceeds to review; pressing Enter again after returning to this row reviews the selection without clearing it. **A** toggles all from any project row. Press **Space** on a project to select or deselect only its eligible items. The selected item count and size update as you choose.
 4. Press **I** to inspect the focused group. You can narrow the selection by provider, category, or individual session. **B** or **Backspace** returns with your selection intact.
 5. Press **Enter** in the project checklist to review exact paths, choose a method with **Up/Down**, and confirm with **Enter** or **Space**. **B** returns to selection without removing anything.
 
@@ -146,7 +147,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 clean
 | Up / Down | Move through projects, providers, categories, or items. |
 | PgUp / PgDn, Home / End | Jump through project and inspector lists by a screen or to either end. |
 | F | Find a project in the checklist by part of its name or path. |
-| Enter | Review selected cleanup in the project checklist; open a row in the inspector. |
+| Enter | Review selected cleanup, including from the select-all row; open other rows in the inspector. |
 | B / Backspace | Go back, preserving selection. From a top-level view, return to the main menu. |
 | Left | Go back one level in the inspector; stays in the project checklist. |
 | Space | Select or deselect eligible items in the focused project, provider, category, or item. |
@@ -156,15 +157,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 clean
 | D | Review selected items and cleanup methods. |
 | Esc / Ctrl+C twice | Exit without further changes. One Ctrl+C waits for another key; any other key continues. |
 
-`[ ]` means eligible but unselected, `[x]` means all eligible items selected, `[~]` means partly selected, and `[-]` means inspection only. Protected items are excluded from group selection and select-all. An item detail shows provider, recorded project, category, session date, logical size, exact path, title and its source, resume command, and eligibility. A stored title is labeled **stored**; a title taken from a first prompt is labeled **derived from first prompt**. Missing metadata leaves a session visible for inspection but not deletion.
+`[ ]` means eligible but unselected, `[x]` means all eligible items selected, `[~]` means partly selected, and `[-]` means inspection only. The inspector also shows **Select all eligible items in this view** above its provider, category, and item lists; **Space** toggles only the items in that view, while **Enter** selects the remaining eligible items and opens review. Protected items are excluded from group selection and select-all. An item detail shows provider, recorded project, category, session date, logical size, exact path, title and its source, resume command, and eligibility. A stored title is labeled **stored**; a title taken from a first prompt is labeled **derived from first prompt**. Missing metadata leaves a session visible for inspection but not deletion.
 
 ## Cleanup safeguards
 
 Recognized Claude session transcripts and matching session sidecar directories, plus known Claude logs, are selectable in normal mode. Advanced mode adds direct entries under known provider cache directories and runtime versions verified against current runtime targets. Credentials, settings, skills, plugins, worktrees, current binaries, active runtimes, and unknown paths are inspection only. A Claude session's project `memory` directory and global `history.jsonl` are never selected with its transcript; Claude may still show history references after transcript removal.
 
-For eligible files and directories, use **Up/Down** and **Enter/Space** to choose the compressed Agent Purge undo folder, the Windows Recycle Bin, permanent removal, or skip. The review shows the selected item count, size, and paths; **PgUp/PgDn** browses path pages and **I** shows full paths. **Keep files (cancel this batch)** is the default confirmation choice: it leaves the selected files untouched. If Codex sessions were also selected, they still need their own separate confirmation. Change file method from its confirmation screen without restarting the whole review. Permanent file and Codex deletion each require a separate acknowledgement screen followed by a final confirmation. No phrase must be typed.
+For eligible files and directories, use **Up/Down** and **Enter/Space** to choose the compressed Agent Purge undo folder, the Windows Recycle Bin, permanent removal, or skip. The review shows the selected item count, size, and paths; **PgUp/PgDn** browses path pages and **I** shows full paths. Recommended or next actions appear first; back and cancel choices appear last. **Keep files (cancel this batch)** remains the default focused confirmation choice and leaves the selected files untouched. If Codex sessions were also selected, they still need their own separate confirmation. Change file method from its confirmation screen without restarting the whole review. Permanent file and Codex deletion each require a separate acknowledgement screen followed by a final confirmation. No phrase must be typed.
 
-The undo folder is the recommended method when you may need to reverse a cleanup. It moves files to the configured location and, on NTFS, asks Windows to compress them in place. A move across drives copies and verifies file contents before removing the original. This is transparent NTFS compression, not a ZIP archive. Text logs and transcripts may shrink substantially; tiny files, already compressed data, and other volume formats may save little or nothing. If compression fails, the moved files remain available for restore without compression. The displayed size is logical size; the reported free-space change is a point-in-time measurement and may include other disk activity.
+The undo folder is the recommended method when you may need to reverse a cleanup. It moves eligible files, including Claude session transcripts, to the configured location and, on NTFS, asks Windows to compress them in place. A move across drives copies and verifies file contents before removing the original. This is transparent NTFS compression, not a ZIP archive. Text logs and transcripts may shrink substantially; tiny files, already compressed data, and other volume formats may save little or nothing. If compression fails, the moved files remain available for restore without compression. The displayed size is logical size, which does not shrink when a file is compressed. The files still occupy space in the undo folder. Check the final **Free space** change on the same drive, or Windows folder Properties > **Size on disk**, to see physical savings. The free-space measurement is a point-in-time value and may include other disk activity. Codex sessions are handled separately by Codex itself and are never included in this undo-folder move.
 
 Each run prints a copy-paste command such as `agent-purge restore <run-id> <hash>` before and after moving files. Restore checks the run hash, skips occupied original paths rather than overwriting them, and reports each result. Close the provider app before restoring. The confirmation and result show each undo folder's full path. With default provider locations, it is `%USERPROFILE%\.agent-purge-undo`; the files for a run are in `payload\<run-id>`, and its manifest is in `runs\<run-id>.json`. Other provider storage volumes have their own `.agent-purge-undo` beside the relevant provider root. A configured folder keeps manifests in `runs` and payloads in `locations\<location-id>\payload\<run-id>`. You can inspect these folders directly. Deleting a run's payload ends its restore option; if you intentionally remove all payload copies for a run, also remove its matching manifest to avoid a stale restore record. `uninstall` leaves undo data in place.
 

@@ -271,9 +271,10 @@ c.close()
     $originalSource = $script:AgentPurgeScript
     try {
         Install-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
-        Assert ((Test-Path (Join-Path $installRoot 'agent-purge.cmd')) -and ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot))) 'Install files/PATH'
+        $initialMarker = Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json
+        Assert ((Test-Path (Join-Path $installRoot 'agent-purge.cmd')) -and ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot)) -and $initialMarker.version -eq '1.0.2') 'Install records version and adds files/PATH'
         $updatedSource = Join-Path $fixture 'updated-agent-purge.ps1'
-        Set-Content -LiteralPath $updatedSource -Value '# update fixture'
+        Set-Content -LiteralPath $updatedSource -Value @('$script:AgentPurgeVersion = ''1.0.1''', '# update fixture')
         $script:AgentPurgeScript = $updatedSource
         Install-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
         Assert ((Get-Content -LiteralPath (Join-Path $installRoot 'agent-purge.ps1') -Raw) -match 'update fixture') 'Update replaces installed script'
@@ -290,7 +291,7 @@ c.close()
         }
         Assert (-not (Update-AgentPurge -InstallRoot $installRoot -PathScope Process)) 'Matching published script needs no update'
         $remoteUpdate = Join-Path $fixture 'remote-agent-purge.ps1'
-        Set-Content -LiteralPath $remoteUpdate -Value '# newer fixture'
+        Set-Content -LiteralPath $remoteUpdate -Value @('$script:AgentPurgeVersion = ''1.0.2''', '# newer fixture')
         $script:updateSource = $remoteUpdate
         Assert (Update-AgentPurge -InstallRoot $installRoot -PathScope Process) 'Explicit update installs published script'
         $installedHash = (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash
@@ -298,13 +299,23 @@ c.close()
         Assert ($installedHash -eq $markerHash -and $installedHash -eq (Get-FileHash -LiteralPath $remoteUpdate -Algorithm SHA256).Hash) 'Update refreshes script and install marker'
         Assert (-not (Update-AgentPurge -InstallRoot $installRoot -PathScope Process)) 'Explicit update reports already current'
         $directUpdate = Join-Path $fixture 'direct-agent-purge.ps1'
-        Set-Content -LiteralPath $directUpdate -Value '# direct update fixture'
+        Set-Content -LiteralPath $directUpdate -Value @('$script:AgentPurgeVersion = ''1.0.3''', '# direct update fixture')
         $script:updateSource = $directUpdate
         function Test-InteractiveTerminal { return $false }
         Assert (Update-AgentPurge -InstallRoot $installRoot -PathScope Process) 'Explicit update works without an interactive terminal'
         $installedHash = (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash
         $markerHash = (Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json).scriptHash
         Assert ($installedHash -eq $markerHash -and $installedHash -eq (Get-FileHash -LiteralPath $directUpdate -Algorithm SHA256).Hash) 'Explicit update refreshes script and marker'
+        $script:updateSource = $remoteUpdate
+        Assert (-not (Update-AgentPurge -InstallRoot $installRoot -PathScope Process) -and (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Older published version cannot replace newer installed features'
+        $sameVersion = Join-Path $fixture 'same-version-agent-purge.ps1'
+        Set-Content -LiteralPath $sameVersion -Value @('$script:AgentPurgeVersion = ''1.0.3''', '# different same-version fixture')
+        $script:updateSource = $sameVersion
+        Assert (-not (Update-AgentPurge -InstallRoot $installRoot -PathScope Process) -and (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Same-version edits cannot silently replace installed features'
+        $legacyUpdate = Join-Path $fixture 'legacy-agent-purge.ps1'
+        Set-Content -LiteralPath $legacyUpdate -Value '# unversioned published fixture'
+        $script:updateSource = $legacyUpdate
+        Assert (-not (Update-AgentPurge -InstallRoot $installRoot -PathScope Process) -and (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Unversioned published script cannot downgrade a versioned install'
         $invalidUpdate = Join-Path $fixture 'invalid-agent-purge.ps1'
         Set-Content -LiteralPath $invalidUpdate -Value '{'
         $script:updateSource = $invalidUpdate
@@ -400,7 +411,7 @@ c.close()
     Assert ((Invoke-ProjectPicker $ui) -eq 'Exit' -and $script:keys.Count -eq 0) 'Picker arrows stay in selection until Escape'
     $jumpUI = [pscustomobject]@{Items=$all;Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
     $orderedGroups = @(Get-ProjectGroups $all)
-    foreach ($key in @('End', 'Spacebar', 'Home', 'Spacebar', 'B')) { $script:keys.Enqueue($key) }
+    foreach ($key in @('End', 'Spacebar', 'Home', 'DownArrow', 'Spacebar', 'B')) { $script:keys.Enqueue($key) }
     Assert ((Invoke-ProjectPicker $jumpUI) -eq 'Back') 'Home and End navigate the project checklist'
     foreach ($item in @($orderedGroups[0].Items) + @($orderedGroups[-1].Items)) {
         if ($item.Eligible) { Assert ($jumpUI.Selected.ContainsKey($item.Key)) 'Home and End select the intended projects' }
@@ -417,6 +428,30 @@ c.close()
     foreach ($key in @('A', 'Escape')) { $script:keys.Enqueue($key) }
     Assert ((Invoke-ProjectPicker $ui) -eq 'Exit') 'Escape exits the picker'
     Assert ($ui.Selected.Count -eq 3) 'A selects all eligible projects from partial selection'
+    $bulkUI = [pscustomobject]@{Items=$all;Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
+    foreach ($key in @('Home', 'Enter', 'B', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $bulkUI) -eq 'Back' -and $bulkUI.Selected.Count -eq 3) 'Enter on select-all chooses eligible items and opens review'
+    Assert ($script:screen -match 'Select all eligible items') 'Project select-all is displayed above the checklist'
+    foreach ($key in @('Home', 'Enter', 'B', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $bulkUI) -eq 'Back' -and $bulkUI.Selected.Count -eq 3) 'Enter on an already selected all row reviews without clearing selection'
+    foreach ($key in @('Home', 'Spacebar', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $bulkUI) -eq 'Back' -and $bulkUI.Selected.Count -eq 0) 'Project select-all row clears the selection'
+    foreach ($key in @('Home', 'Spacebar', 'Enter', 'B', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $bulkUI) -eq 'Back' -and $bulkUI.Selected.Count -eq 3) 'Space then Enter reviews all selected projects without deselecting them'
+    $bulkUI.Selected.Clear()
+    foreach ($key in @('UpArrow', 'Enter', 'B', 'Escape')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-InventoryUI $bulkUI) -eq 'Exit' -and $bulkUI.Selected.Count -eq 3) 'Inspector select-all row selects eligible items and opens review'
+    Assert ($script:screen -match 'Select all eligible items in this view') 'Inspector select-all is displayed above its list'
+    foreach ($key in @('UpArrow', 'Spacebar', 'Escape')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-InventoryUI $bulkUI) -eq 'Exit' -and $bulkUI.Selected.Count -eq 0) 'Inspector select-all row clears the selection'
+    foreach ($key in @('UpArrow', 'Spacebar', 'Enter', 'B', 'Escape')) { $script:keys.Enqueue($key) }
+    [void](Invoke-InventoryUI $bulkUI $orderedGroups[0].Key)
+    Assert ($bulkUI.Selected.Count -eq (Get-InventorySummary $orderedGroups[0].Items).EligibleCount) 'Scoped inspector Space then Enter reviews without clearing the project selection'
+    $providerUI = [pscustomobject]@{Items=$all;Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
+    foreach ($key in @('Enter', 'Home', 'Enter', 'B', 'Escape')) { $script:keys.Enqueue($key) }
+    [void](Invoke-InventoryUI $providerUI)
+    $firstProvider = @(Get-ViewRows $all ([pscustomobject]@{Level=0;Provider='';Category='';Index=0;DetailKey=''}))[0]
+    Assert ($providerUI.Selected.Count -eq @($all | Where-Object Provider -eq $firstProvider).Count) 'Nested select-all applies only to the opened provider'
     $emptyUI = [pscustomobject]@{Items=@();Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
     foreach ($key in @('Enter', 'A', 'Spacebar', 'B')) { $script:keys.Enqueue($key) }
     Assert ((Invoke-ProjectPicker $emptyUI) -eq 'Back') 'Empty inventory remains navigable without cleanup'
@@ -429,10 +464,27 @@ c.close()
     Assert (((Show-StartMenu 'project' $project) -join ' ') -eq '__scope global') 'Project menu can switch to global scope for this run'
     foreach ($key in @('DownArrow', 'DownArrow', 'DownArrow', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
     Assert (((Show-StartMenu) -join ' ') -eq 'settings') 'Home menu opens settings with arrow keys'
-    foreach ($key in @('UpArrow', 'Spacebar')) { $script:keys.Enqueue($key) }
+    $script:screen.Clear()
+    foreach ($key in @('RightArrow', 'Spacebar')) { $script:keys.Enqueue($key) }
     Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 46) 'Keyboard settings save the adjusted retention'
+    Assert (($script:screen -join "`n") -match 'unsaved' -and ($script:screen -join "`n") -match 'Saved retention: 45 days') 'Settings distinguish the draft from the saved value'
+    $script:screen.Clear()
     foreach ($key in @('DownArrow', 'B')) { $script:keys.Enqueue($key) }
     Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 46) 'Back leaves settings unchanged'
+    Assert ($script:screen -match '> Move undo folder' -and $script:screen -match 'Undo location:') 'Down selects the undo location action without changing retention'
+    foreach ($key in @('LeftArrow', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 46) 'Back discards an edited retention value'
+    $script:answers.Enqueue('')
+    foreach ($key in @('DownArrow', 'Enter', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and $script:answers.Count -eq 0) 'Enter opens the focused undo location action'
+    $script:screen.Clear()
+    foreach ($key in @('DownArrow', 'DownArrow', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and $script:screen -match '> Clean undo folder') 'Down reaches the undo cleanup action'
+    $script:screen.Clear()
+    foreach ($key in @('UpArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and $script:screen -match '> Back to main menu') 'Back action is last in settings'
+    foreach ($key in @('C', 'B', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and $script:keys.Count -eq 0) 'Settings returns directly from the saved-run browser'
     foreach ($key in @('P', 'Escape')) { $script:keys.Enqueue($key) }
     $script:answers.Enqueue('')
     Assert (@(Show-StartMenu).Count -eq 0) 'Empty project path returns to home; Escape exits'
@@ -450,6 +502,9 @@ c.close()
     Assert (-not (Test-Path -LiteralPath $refreshFile) -and $refreshUI.Selected.Count -eq 0) 'Cleanup refresh drops removed selections'
     Assert ($refreshFile -notin $refreshUI.Items.Path -and $claudeFile -in $refreshUI.Items.Path) 'Refresh measures remaining inventory without deleting unselected history'
     function Get-TerminalSize { return [pscustomobject]@{Width=80;Height=24} }
+    $script:screen.Clear()
+    $script:keys.Enqueue('Escape')
+    Assert ((Show-SettingsMenu $ctx) -eq 'Exit' -and $script:screen.Count -lt 24 -and @($script:screen | Where-Object Length -ge 80).Count -eq 0) 'Settings controls fit an 80x24 terminal'
     $script:screen.Clear()
     $script:keys.Enqueue('Escape')
     [void](Invoke-ProjectPicker $ui)
@@ -492,6 +547,7 @@ c.close()
     function Update-AgentPurge { $script:explicitUpdateRequests++ }
     Invoke-AgentPurge @('update')
     Assert ($script:explicitUpdateRequests -eq 1) 'Update command dispatches without scanning or a terminal'
+    Assert (((Invoke-AgentPurge @('--version')) -join ' ') -eq 'Agent Purge 1.0.2') 'Version command reports the embedded release version'
     $requestCount = $script:scanRequests.Count
     foreach ($invalid in @(@('clean', '--all', '--yes'), @('clean', '--project'), @('clean', '--all', '--project', $project), @('scan', '--global', '--wrong'))) {
         $rejected = $false
@@ -562,6 +618,8 @@ c.close()
     Assert ((Test-Path $named) -and $script:recycled.Count -eq 0) 'Failed Recycle Bin move retains the named undo folder for retry'
     [void](Invoke-ExpiredUndoRuns $ctx)
     Assert ($script:recycled.Count -eq 1 -and -not (Test-Path $named) -and (Test-Path (Join-Path $script:recycled[0] 'agent-purge-manifest.json'))) 'Expiry retries and recycles one folder with its manifest'
+    $expiredListed = @( (Get-UndoRunInventory $ctx).Runs | Where-Object Key -eq $expiryRun.RunId )
+    Assert ($expiredListed.Count -eq 1 -and $expiredListed[0].Expired -and $expiredListed[0].Stored.Count -eq 0) 'Undo browser labels expired runs without claiming automatic restore'
     $expiredRestoreRejected = $false
     try { Invoke-UndoRestore $ctx $expiryRun.RunId $expiryRun.Hash | Out-Null } catch { $expiredRestoreRejected = $true }
     Assert ($expiredRestoreRejected -and -not (Test-Path $expiryFile)) 'Expired restore command refuses the run'
@@ -608,28 +666,61 @@ c.close()
     function Invoke-ExpiredUndoRuns { param($Context) return [pscustomobject]@{ Moved = 1; Skipped = 0 } }
     $script:keys.Enqueue('Enter')
     Assert ((Show-ExpiryCheck $ctx) -eq 'Continue' -and $script:keys.Count -eq 0 -and $script:screen -match 'Undo expiry: 1 folder') 'Expiry result stays visible until acknowledged before the menu redraws'
-    $script:keys.Enqueue('Enter')
+    $undoFileOne = Join-Path $migrationClaude 'debug\select-one.txt'
+    $undoFileTwo = Join-Path $migrationClaude 'debug\select-two.txt'
+    Set-Content -LiteralPath $undoFileOne -Value ('one' * 100)
+    Set-Content -LiteralPath $undoFileTwo -Value ('two' * 100)
+    $undoRunOne = New-UndoRun @((New-InventoryItem $migrationContext 'Claude' 'Logs' 'Log' $undoFileOne '' '' '' '' '' '' $true)) $migrationContext
+    Invoke-UndoMove $undoFileOne $undoRunOne.Entries[0].Archived
+    $undoRunTwo = New-UndoRun @((New-InventoryItem $migrationContext 'Claude' 'Logs' 'Log' $undoFileTwo '' '' '' '' '' '' $true)) $migrationContext
+    Invoke-UndoMove $undoFileTwo $undoRunTwo.Entries[0].Archived
+    $undoInventory = Get-UndoRunInventory $migrationContext
+    Assert (@($undoInventory.Runs | Where-Object { $_.Stored.Count -eq 1 }).Count -eq 2) 'Undo inventory lists runs with saved payloads separately'
+    $rogueUndo = Join-Path (Split-Path -Parent $undoRunOne.Entries[0].Archived) 'unrecognized.txt'
+    Set-Content -LiteralPath $rogueUndo -Value 'do not delete'
+    $unsafePayloadRejected = $false
+    try { Test-UndoRunPayload (@($undoInventory.Runs | Where-Object Key -eq $undoRunOne.RunId)[0]) $migrationContext (Split-Path -Parent $undoRunOne.Entries[0].Archived) } catch { $unsafePayloadRejected = $true }
+    Assert ($unsafePayloadRejected -and (Test-Path $rogueUndo)) 'Unknown undo payload contents block run cleanup'
+    Remove-Item -LiteralPath $rogueUndo
+    $script:screen.Clear()
+    $script:keys.Enqueue('Escape')
+    [void](Invoke-UndoFolderCleanup $migrationContext)
+    Assert ($script:screen.Count -lt 24 -and @($script:screen | Where-Object Length -ge 80).Count -eq 0) 'Undo browser keeps selection and back controls visible at 80x24'
+    $script:screen.Clear()
+    foreach ($key in @('DownArrow', 'I', 'I', 'Enter', 'B', 'A', 'B')) { $script:keys.Enqueue($key) }
     Invoke-UndoFolderCleanup $migrationContext
-    Assert ((Test-Path $secondUndoLocation) -and $script:keys.Count -eq 0) 'Default undo cleanup choice keeps saved data'
-    $script:undoCleanMethod = ''
+    Assert ($script:screen -match 'Restore: agent-purge restore' -and $script:screen -match '\[x\] Select all runs' -and (Test-Path $undoRunOne.Entries[0].Archived)) 'Undo browser inspects original paths and offers select all without deleting'
+    $invalidUndo = Join-Path (Join-Path $secondUndoLocation 'runs') 'invalid.json'
+    Set-Content -LiteralPath $invalidUndo -Value '{'
+    Assert ((Get-UndoRunInventory $migrationContext).Warnings.Count -eq 1 -and (Test-Path $invalidUndo)) 'Invalid undo manifest is reported and never selectable'
+    $script:recycledUndo = New-Object 'System.Collections.Generic.List[string]'
     function Invoke-FileRemoval {
         param([string]$Path, [string]$Method)
-        $script:undoCleanMethod = $Method
-        if ($Method -eq 'Recycle Bin') { [IO.Directory]::Move($Path, (Join-Path $migrationBase 'recycled-undo')) }
-        else { Remove-Item -LiteralPath $Path -Recurse -Force }
+        if ($Method -eq 'Recycle Bin') {
+            $targetRoot = Join-Path $migrationBase 'recycled-selected'
+            New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
+            $target = Join-Path $targetRoot ([guid]::NewGuid().ToString('N'))
+            if (Test-Path -LiteralPath $Path -PathType Container) { [IO.Directory]::Move($Path, $target) }
+            else { [IO.File]::Move($Path, $target) }
+            $script:recycledUndo.Add($target)
+        } else { Remove-Item -LiteralPath $Path -Recurse -Force }
     }
-    foreach ($key in @('UpArrow', 'UpArrow', 'Enter', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    $runTwoPosition = [array]::IndexOf(@((Get-UndoRunInventory $migrationContext).Runs | ForEach-Object Key), $undoRunTwo.RunId) + 1
+    Assert ($runTwoPosition -gt 0) 'Selected recycle run remains in undo inventory'
+    for ($step = 0; $step -lt $runTwoPosition; $step++) { $script:keys.Enqueue('DownArrow') }
+    foreach ($key in @('Spacebar', 'D', 'Enter', 'Enter', 'UpArrow', 'Enter', 'Enter', 'B')) { $script:keys.Enqueue($key) }
     Invoke-UndoFolderCleanup $migrationContext
-    Assert ($script:undoCleanMethod -eq 'Recycle Bin' -and -not (Test-Path $secondUndoLocation) -and (Test-Path (Join-Path $migrationBase 'recycled-undo\runs'))) 'Confirmed undo cleanup recycles the configured folder and manifests'
-    $permanentFile = Join-Path $migrationClaude 'debug\permanent.txt'
-    Set-Content -LiteralPath $permanentFile -Value 'fixture undo'
-    $permanentItem = New-InventoryItem $migrationContext 'Claude' 'Logs' 'Log' $permanentFile '' '' '' '' '' '' $true
-    $permanentRun = New-UndoRun @($permanentItem) $migrationContext
-    Invoke-UndoMove $permanentFile $permanentRun.Entries[0].Archived
-    $script:undoCleanMethod = ''
-    foreach ($key in @('UpArrow', 'Enter', 'DownArrow', 'Enter', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    Assert (-not (Test-Path $undoRunTwo.Entries[0].Archived) -and (Test-Path $undoRunOne.Entries[0].Archived) -and $script:recycledUndo.Count -eq 2) 'Selected undo run recycles payload and manifest while leaving other runs restorable'
+    Assert (@($script:recycledUndo | Where-Object { Test-Path (Join-Path $_ 'agent-purge-manifest.json') }).Count -eq 1) 'Recycled payload carries a manifest copy for manual recovery'
+    $runOnePosition = [array]::IndexOf(@((Get-UndoRunInventory $migrationContext).Runs | ForEach-Object Key), $undoRunOne.RunId) + 1
+    Assert ($runOnePosition -gt 0) 'Selected permanent run remains in undo inventory'
+    for ($step = 0; $step -lt $runOnePosition; $step++) { $script:keys.Enqueue('DownArrow') }
+    foreach ($key in @('Spacebar', 'D', 'Enter', 'DownArrow', 'Enter', 'UpArrow', 'Enter', 'UpArrow', 'Enter', 'Enter', 'B')) { $script:keys.Enqueue($key) }
     Invoke-UndoFolderCleanup $migrationContext
-    Assert ($script:undoCleanMethod -eq 'Permanent' -and -not (Test-Path $secondUndoLocation)) 'Permanent undo cleanup requires acknowledgement and final confirmation'
+    Assert (-not (Test-Path $undoRunOne.Entries[0].Archived) -and (Test-Path $secondUndoLocation) -and (Test-Path (Join-Path $secondUndoLocation 'agent-purge-undo-v1.marker'))) 'Permanent cleanup removes only selected run after warning and final confirmation'
+    foreach ($key in @('Enter', 'Enter', 'DownArrow', 'Enter', 'UpArrow', 'Enter', 'UpArrow', 'Enter', 'Enter', 'Enter')) { $script:keys.Enqueue($key) }
+    Invoke-UndoFolderCleanup $migrationContext
+    Assert ((Get-UndoRunInventory $migrationContext).Runs.Count -eq 0 -and (Test-Path $invalidUndo) -and (Test-Path (Join-Path $secondUndoLocation 'agent-purge-undo-v1.marker'))) 'Select-all removes valid saved runs while preserving invalid data and the undo marker'
     $script:undoPathArgument = ''
     $script:undoCleanRequests = 0
     function Set-AgentPurgeUndoDirectory { param($Context, [string]$Path) $script:undoPathArgument = $Path }
