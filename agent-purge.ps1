@@ -1,6 +1,6 @@
 # Windows PowerShell 5.1 compatible. Dot-source this file to exercise its functions with fixtures.
 $script:AgentPurgeScript = $PSCommandPath
-$script:AgentPurgeVersion = '1.0.2'
+$script:AgentPurgeVersion = '1.0.3'
 
 function Get-AgentPurgeScriptVersion([string]$Path, [bool]$AllowLegacy = $false) {
     $source = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
@@ -892,6 +892,8 @@ function Set-AgentPurgeUndoDirectory($Context, [string]$Path) {
         }
     }
     if (Test-Path -LiteralPath $migrationMarker) { Remove-Item -LiteralPath $migrationMarker -Force -ErrorAction Stop }
+    try { Write-UndoCompressionResult $target }
+    catch { Write-Host "Undo folder moved, but compression could not be checked: $($_.Exception.Message)" -ForegroundColor Yellow }
     Write-Host "Undo folder set to $target. Existing undo data was verified at the new location."
 }
 
@@ -901,11 +903,11 @@ function Get-UndoRunInventory($Context) {
     if (-not (Test-Path -LiteralPath $root)) { return $result }
     Initialize-UndoRoot $root
     $runsPath = Join-Path $root 'runs'
-    if (-not (Test-Path -LiteralPath $runsPath)) { return $result }
-    if (-not (Test-NoReparse $runsPath)) { throw 'Unsafe undo manifest directory' }
+    if ((Test-Path -LiteralPath $runsPath) -and -not (Test-NoReparse $runsPath)) { throw 'Unsafe undo manifest directory' }
     $runs = New-Object 'System.Collections.Generic.List[object]'
     $warnings = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($file in (Get-ChildItem -LiteralPath $runsPath -File -Filter '*.json' -ErrorAction Stop)) {
+    $manifestFiles = if (Test-Path -LiteralPath $runsPath) { @(Get-ChildItem -LiteralPath $runsPath -File -Filter '*.json' -ErrorAction Stop) } else { @() }
+    foreach ($file in $manifestFiles) {
         try {
             if ($file.BaseName -cnotmatch '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$' -or -not (Test-NoReparse $file.FullName)) { throw 'Invalid or unsafe manifest path' }
             $run = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -940,6 +942,27 @@ function Get-UndoRunInventory($Context) {
             })
             if ($incomplete) { $warnings.Add("$($file.Name): saved size is incomplete; this run cannot be cleaned automatically") }
         } catch { $warnings.Add("$($file.Name): $($_.Exception.Message)") }
+    }
+    $manifestIds = @{}
+    foreach ($file in $manifestFiles) { $manifestIds[$file.BaseName] = $true }
+    $locationRoots = @($root)
+    $locations = Join-Path $root 'locations'
+    if (Test-Path -LiteralPath $locations) {
+        if (-not (Test-NoReparse $locations)) { $warnings.Add("Unsafe undo locations: $locations") }
+        else { $locationRoots += @(Get-ChildItem -LiteralPath $locations -Directory -Force -ErrorAction Stop) }
+    }
+    foreach ($location in $locationRoots) {
+        $locationPath = if ($location -is [string]) { $location } else { $location.FullName }
+        if (-not (Test-NoReparse $locationPath)) { $warnings.Add("Unsafe undo location: $locationPath"); continue }
+        $payload = Join-Path $locationPath 'payload'
+        if (-not (Test-Path -LiteralPath $payload)) { continue }
+        if (-not (Test-NoReparse $payload)) { $warnings.Add("Unsafe undo payload: $payload"); continue }
+        foreach ($directory in (Get-ChildItem -LiteralPath $payload -Directory -Force -ErrorAction Stop)) {
+            if ($manifestIds.ContainsKey($directory.Name)) { continue }
+            if (-not (Test-NoReparse $directory.FullName $true)) { $warnings.Add("Unsafe untracked undo data: $($directory.FullName)"); continue }
+            $size = Get-PathSize $directory.FullName
+            $warnings.Add("Untracked undo data: $(Format-Bytes $size.Bytes) at $($directory.FullName). No restore manifest; inspect manually.")
+        }
     }
     $result.Runs = @($runs.ToArray() | Sort-Object { $_.Run.RunId } -Descending)
     $result.Warnings = $warnings.ToArray()
@@ -1100,7 +1123,7 @@ function Invoke-UndoFolderCleanup($Context) {
         Write-ScreenLine 'AGENT PURGE / CLEAN SAVED UNDO RUNS' Cyan
         Write-ScreenLine ('Selected: {0}/{1} eligible runs | {2} logical' -f $summary.SelectedCount, $summary.EligibleCount, (Format-Bytes $summary.SelectedBytes)) Cyan
         Write-ScreenLine 'Each run contains saved files and a restore manifest. Deleting it ends automatic restore.' Yellow
-        if ($inventory.Warnings.Count) { Write-ScreenLine ("$($inventory.Warnings.Count) run(s) need manual review and were left untouched.") Yellow }
+        if ($inventory.Warnings.Count) { Write-ScreenLine ("$($inventory.Warnings.Count) undo warning(s); press W to read them. Affected data was left untouched.") Yellow }
         Write-ScreenLine ''
         Write-ScreenLine ('{0} {1} Select all runs' -f $(if ($index -eq 0) { '>' } else { ' ' }), (Get-SelectionMark $items $selected)) $(if ($index -eq 0) { 'White' } else { 'Gray' })
         for ($i = $start; $i -lt [math]::Min($items.Count, $start + $limit); $i++) {
@@ -1112,9 +1135,17 @@ function Invoke-UndoFolderCleanup($Context) {
         Write-ScreenLine ('{0} Back / keep undo data' -f $(if ($index -eq $items.Count + 2) { '>' } else { ' ' })) $(if ($index -eq $items.Count + 2) { 'White' } else { 'Gray' })
         Write-ScreenLine $notice Yellow
         Write-ScreenLine 'Up/Down move | Space toggle | A select/clear all | Enter inspect/review'
-        Write-ScreenLine 'D review | I inspect | PgUp/PgDn jump | B back | Esc quit'
+        Write-ScreenLine 'D review | I inspect | W warnings | PgUp/PgDn jump | B back | Esc quit'
         $notice = ''
         $key = Read-MenuKey
+        if ($key -eq 'W' -and $inventory.Warnings.Count) {
+            Clear-Host
+            Write-Host 'Undo data needing manual review:'
+            foreach ($warning in $inventory.Warnings) { Write-Host $warning }
+            Write-Host 'Press any key to return to saved runs.'
+            if ((Read-MenuKey) -eq 'Escape') { return 'Exit' }
+            continue
+        }
         if ($key -eq 'Escape') { return 'Exit' }
         if ($key -in @('B', 'Backspace')) { return }
         if ($key -eq 'UpArrow') { $index = ($index + $items.Count + 2) % ($items.Count + 3); continue }
@@ -1180,6 +1211,30 @@ function Invoke-UndoCompress([string]$Archived) {
         & compact.exe /C /Q /A $Archived *> $null
     }
     return $LASTEXITCODE -eq 0
+}
+
+function Write-UndoCompressionResult([string]$Root) {
+    if (-not (Test-Path -LiteralPath $Root)) { Write-Host "No undo files at $Root"; return }
+    Initialize-UndoRoot $Root
+    if (-not (Test-NoReparse $Root $true)) { throw "Unsafe undo folder contents: $Root" }
+    $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction Stop)
+    $before = @( $files | Where-Object { $_.Attributes -band [IO.FileAttributes]::Compressed } ).Count
+    if (-not (Invoke-UndoCompress $Root)) {
+        Write-Host "NTFS compression unavailable or failed at $Root. Saved files remain available for restore."
+        return
+    }
+    $after = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction Stop |
+        Where-Object { $_.Attributes -band [IO.FileAttributes]::Compressed }).Count
+    Write-Host "Compressed files: $before -> $after of $($files.Count) at $Root."
+    Write-Host 'File flags do not show bytes saved. Compare drive free space or Windows Size on disk.'
+}
+
+function Invoke-UndoCompression($Context) {
+    $config = Get-AgentPurgeConfig $Context
+    $roots = if ($config.UndoDirectory) { @($config.UndoDirectory) }
+        else { @(Get-LegacyUndoRoots $Context | Where-Object { Test-Path -LiteralPath $_ }) }
+    if (-not $roots.Count) { Write-Host 'No saved undo folders found.'; return }
+    foreach ($root in $roots) { Write-UndoCompressionResult $root }
 }
 
 function Get-UndoExpiry($Run) {
@@ -1394,7 +1449,7 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
     if ($review -ne 'Continue to cleanup methods') { return }
     $confirmFiles = $false; $confirmCodex = $false
     $preview = @{}
-    $before = Get-FreeSpace $selected
+    $undoRoots = @()
     if ($files.Count) {
         while ($true) {
             $choice = Read-CleanupChoice 'CHOOSE FILE METHOD' $files @('Compressed undo folder (recommended)', 'Recycle Bin', 'Permanent', 'Keep files (skip this batch)', 'Back to selection') 0 'This method applies only to files, not Codex sessions. Undo uses NTFS compression when available.'
@@ -1434,6 +1489,11 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
         }
     }
     if (-not $confirmFiles -and -not $confirmCodex) { return }
+    $measured = @($selected)
+    if ($confirmFiles -and $method -eq 'Undo folder') {
+        $measured += @($undoRoots | ForEach-Object { [pscustomobject]@{ Path = $_ } })
+    }
+    $before = Get-FreeSpace $measured
     $undoRun = $null; $undoPaths = @{}
     if ($confirmFiles -and $method -eq 'Undo folder') {
         $undoRun = New-UndoRun $files $Context
@@ -1489,13 +1549,16 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
         Write-Host ("Undo manifest: {0}" -f (Join-Path (Join-Path (Get-UndoManifestRoot $Context) 'runs') ($undoRun.RunId + '.json')))
         Write-Host 'Undo files still use disk space. Inventory shows logical size, which does not shrink with NTFS compression; check free-space change or Size on disk for savings. Codex deletions are not part of this restore.'
     }
-    $after = Get-FreeSpace $selected
+    $after = Get-FreeSpace $measured
     foreach ($root in $before.Keys) {
         if ($after.ContainsKey($root)) {
             $delta = [long]($after[$root] - $before[$root])
             $change = if ($delta -ge 0) { '+' + (Format-Bytes $delta) } else { Format-Bytes $delta }
             Write-Host ("Free space {0}: {1} -> {2} ({3})" -f $root, (Format-Bytes $before[$root]), (Format-Bytes $after[$root]), $change)
         }
+    }
+    if ($confirmFiles -and $method -eq 'Undo folder') {
+        Write-Host 'A move to another drive frees source space and uses destination space. Compare both drives; logical file size does not change.'
     }
     return $true
 }
@@ -1943,6 +2006,7 @@ Usage:
   agent-purge settings set undo-dir <absolute-path>
                                     Move existing undo data and store new runs there
   agent-purge undo clean            Inspect and clean selected saved undo runs
+  agent-purge undo compress         Retry NTFS compression for existing saved undo files
   agent-purge install               Install a user-local launcher and PATH entry
   agent-purge update                Install a newer version from published main
   agent-purge --version             Show the installed script version
@@ -1978,7 +2042,7 @@ function Show-SettingsMenu($Context) {
     $saved = Get-AgentPurgeConfig $Context
     $days = $saved.RetentionDays
     $index = 0
-    $labels = @('Undo retention', 'Move undo folder', 'Clean undo folder', 'Back to main menu')
+    $labels = @('Undo retention', 'Move undo folder', 'Clean undo folder', 'Compress saved undo files', 'Back to main menu')
     while ($true) {
         Clear-Host
         Write-ScreenLine 'AGENT PURGE / SETTINGS' Cyan
@@ -1996,7 +2060,8 @@ function Show-SettingsMenu($Context) {
             0 { 'Adjust days with Left/Right (1), PgUp/PgDn (10), or Home (30); Enter saves.' }
             1 { 'Enter opens a path prompt. Existing undo runs move to the new folder.' }
             2 { 'Enter lists saved undo runs for inspection and selective cleanup.' }
-            3 { 'Enter returns to the main menu without saving an edited retention value.' }
+            3 { 'Enter retries NTFS compression on saved undo files.' }
+            4 { 'Enter returns to the main menu without saving an edited retention value.' }
         }
         Write-ScreenLine $description Yellow
         Write-ScreenLine 'Retention changes apply only to new undo runs.' DarkGray
@@ -2037,7 +2102,13 @@ function Show-SettingsMenu($Context) {
             2 {
                 if ((Invoke-UndoFolderCleanup $Context) -eq 'Exit') { return 'Exit' }
             }
-            3 { return 'Back' }
+            3 {
+                try { Invoke-UndoCompression $Context }
+                catch { Write-Host "Compression stopped: $($_.Exception.Message)" -ForegroundColor Yellow }
+                Write-Host 'Press any key to return to settings.'
+                [void](Read-MenuKey)
+            }
+            4 { return 'Back' }
         }
     }
 }
@@ -2177,6 +2248,10 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
         if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'undo' -and $Arguments[1] -eq 'clean') {
             Invoke-UndoFolderCleanup (New-AgentPurgeContext)
+            return
+        }
+        if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'undo' -and $Arguments[1] -eq 'compress') {
+            Invoke-UndoCompression (New-AgentPurgeContext)
             return
         }
         if ($Arguments[0] -eq 'scope') {

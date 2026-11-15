@@ -272,7 +272,7 @@ c.close()
     try {
         Install-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
         $initialMarker = Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json
-        Assert ((Test-Path (Join-Path $installRoot 'agent-purge.cmd')) -and ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot)) -and $initialMarker.version -eq '1.0.2') 'Install records version and adds files/PATH'
+        Assert ((Test-Path (Join-Path $installRoot 'agent-purge.cmd')) -and ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot)) -and $initialMarker.version -eq '1.0.3') 'Install records version and adds files/PATH'
         $updatedSource = Join-Path $fixture 'updated-agent-purge.ps1'
         Set-Content -LiteralPath $updatedSource -Value @('$script:AgentPurgeVersion = ''1.0.1''', '# update fixture')
         $script:AgentPurgeScript = $updatedSource
@@ -358,6 +358,10 @@ c.close()
     $firstUndoLocation = Join-Path $migrationBase 'custom-undo-one'
     Set-AgentPurgeUndoDirectory $migrationContext $firstUndoLocation | Out-Null
     Assert (-not (Test-Path $legacyRoot) -and -not (Test-Path $otherLegacyRoot) -and (Test-Path (Join-Path $firstUndoLocation ('runs\' + $oldRun.RunId + '.json')))) 'Changing undo location moves all old roots and manifests'
+    if (([IO.DriveInfo]::new([IO.Path]::GetPathRoot($firstUndoLocation))).DriveFormat -eq 'NTFS' -and (Get-Command compact.exe -ErrorAction SilentlyContinue)) {
+        $migratedPath = Resolve-UndoEntryPath $oldRun.Entries[0] $oldRun.RunId $migrationContext
+        Assert (((Get-Item -LiteralPath $migratedPath -Force).Attributes -band [IO.FileAttributes]::Compressed) -ne 0) 'Undo migration recompresses copied payloads'
+    }
     Invoke-UndoRestore $migrationContext $oldRun.RunId $oldRun.Hash | Out-Null
     Assert ((Get-Content -LiteralPath $oldFile -Raw) -eq ('legacy undo data' * 100) -and (Get-Content -LiteralPath $oldRuntime -Raw) -eq 'legacy runtime') 'Existing restore command works across migrated roots'
     $newFile = Join-Path $migrationClaude 'debug\new.txt'
@@ -365,6 +369,11 @@ c.close()
     $newItem = New-InventoryItem $migrationContext 'Claude' 'Logs' 'Log' $newFile '' '' '' '' '' '' $true
     $newRun = New-UndoRun @($newItem) $migrationContext
     Invoke-UndoMove $newFile $newRun.Entries[0].Archived
+    $compressionOutput = @(Invoke-UndoCompression $migrationContext 6>&1)
+    if (([IO.DriveInfo]::new([IO.Path]::GetPathRoot($newRun.Entries[0].Archived))).DriveFormat -eq 'NTFS' -and (Get-Command compact.exe -ErrorAction SilentlyContinue)) {
+        Assert (((Get-Item -LiteralPath $newRun.Entries[0].Archived -Force).Attributes -band [IO.FileAttributes]::Compressed) -ne 0) 'Undo compression retries existing saved files'
+    }
+    Assert (($compressionOutput -join ' ') -match 'Compressed files:|compression unavailable') 'Undo compression reports a result'
     $secondUndoLocation = Join-Path $migrationBase 'custom-undo-two'
     Set-AgentPurgeUndoDirectory $migrationContext $secondUndoLocation | Out-Null
     Assert (-not (Test-Path $firstUndoLocation) -and (Get-AgentPurgeConfig $migrationContext).UndoHistory -contains $firstUndoLocation) 'Moving a configured undo location retains prior path compatibility'
@@ -547,7 +556,7 @@ c.close()
     function Update-AgentPurge { $script:explicitUpdateRequests++ }
     Invoke-AgentPurge @('update')
     Assert ($script:explicitUpdateRequests -eq 1) 'Update command dispatches without scanning or a terminal'
-    Assert (((Invoke-AgentPurge @('--version')) -join ' ') -eq 'Agent Purge 1.0.2') 'Version command reports the embedded release version'
+    Assert (((Invoke-AgentPurge @('--version')) -join ' ') -eq 'Agent Purge 1.0.3') 'Version command reports the embedded release version'
     $requestCount = $script:scanRequests.Count
     foreach ($invalid in @(@('clean', '--all', '--yes'), @('clean', '--project'), @('clean', '--all', '--project', $project), @('scan', '--global', '--wrong'))) {
         $rejected = $false
@@ -693,6 +702,17 @@ c.close()
     $invalidUndo = Join-Path (Join-Path $secondUndoLocation 'runs') 'invalid.json'
     Set-Content -LiteralPath $invalidUndo -Value '{'
     Assert ((Get-UndoRunInventory $migrationContext).Warnings.Count -eq 1 -and (Test-Path $invalidUndo)) 'Invalid undo manifest is reported and never selectable'
+    $orphan = Join-Path (Join-Path $secondUndoLocation 'locations\orphan\payload\missing-manifest') '0'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $orphan) -Force | Out-Null
+    Set-Content -LiteralPath $orphan -Value ('orphan data' * 100)
+    $orphanInventory = Get-UndoRunInventory $migrationContext
+    Assert (@($orphanInventory.Warnings | Where-Object { $_ -match 'Untracked undo data:' -and $_ -match 'missing-manifest' }).Count -eq 1 -and @($orphanInventory.Runs | Where-Object Key -eq 'missing-manifest').Count -eq 0) 'Untracked undo payload is visible but cannot be selected'
+    $script:screen.Clear()
+    $script:keys.Enqueue('W')
+    $script:keys.Enqueue('Enter')
+    $script:keys.Enqueue('B')
+    Invoke-UndoFolderCleanup $migrationContext
+    Assert (($script:screen -join ' ') -match 'missing-manifest' -and (Test-Path $orphan)) 'Warning screen shows the orphan path without deleting it'
     $script:recycledUndo = New-Object 'System.Collections.Generic.List[string]'
     function Invoke-FileRemoval {
         param([string]$Path, [string]$Method)
