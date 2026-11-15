@@ -61,7 +61,7 @@ To remove the installed script, launcher, marker, and only its PATH entry:
 agent-purge uninstall
 ```
 
-Uninstall preserves other files in the install directory and refuses to remove an installed script or launcher that was modified after installation. It leaves the Git checkout or downloaded source file and any Agent Purge undo folders in place; those can be removed separately when no longer needed.
+Uninstall preserves other files in the install directory and refuses to remove an installed script or launcher that was modified after installation. It leaves the Git checkout or downloaded source file, `%LOCALAPPDATA%\agent-purge\config.json`, and any Agent Purge undo folders in place; those can be removed separately when no longer needed.
 
 ## Commands
 
@@ -79,9 +79,18 @@ Uninstall preserves other files in the install directory and refuses to remove a
 | `agent-purge update` | Update the installed command from published `main`. |
 | `agent-purge uninstall` | Remove the installed files and PATH entry. |
 | `agent-purge restore <run-id> <hash>` | Restore files saved by one undo-folder cleanup run. |
+| `agent-purge settings` | Change undo retention with arrow keys. |
+| `agent-purge settings show` | Display the saved retention value. |
+| `agent-purge settings set retention-days <1-365>` | Set retention for future undo runs. |
 | `agent-purge --help` | Print command and key help. |
 
 Both `scan` and `clean` require an interactive terminal to select or remove items. Redirected input always prints a **read-only** inventory, even with `clean --all`; there is no unattended deletion option. The global scan may take time because it measures logical file sizes. Inaccessible entries are marked **incomplete**, and affected totals are lower bounds.
+
+## Settings
+
+Choose **Settings** from the main menu, or run `agent-purge settings`. Use arrows to change the undo retention by one day, PgUp/PgDn by ten days, Home to return to 30 days, and Enter/Space to save. B/Backspace leaves without saving. The default is 30 days; the allowed range is 1–365. The optional `settings show` and `settings set retention-days <days>` commands provide the same value without the menu.
+
+Settings are stored in `%LOCALAPPDATA%\agent-purge\config.json`. Each new undo run records its creation time and deadline from the current setting; changing the setting does not rewrite existing runs. A missing config uses the default, while an invalid config prevents new undo runs until corrected. The config is user-local and is not removed by `uninstall`.
 
 ## Choose projects and clean
 

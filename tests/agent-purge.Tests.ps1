@@ -15,7 +15,18 @@ try {
     $claudeRoot = Join-Path $fixture 'claude'
     $packages = Join-Path $codexRoot 'packages'
     $versions = Join-Path $fixture 'versions'
-    $ctx = New-AgentPurgeContext -CodexRoot $codexRoot -ClaudeRoot $claudeRoot -CodexPackages $packages -ClaudeVersions $versions -ClaudeBinary (Join-Path $fixture 'claude.exe') -CodexBinary (Join-Path $fixture 'codex.exe')
+    $ctx = New-AgentPurgeContext -CodexRoot $codexRoot -ClaudeRoot $claudeRoot -CodexPackages $packages -ClaudeVersions $versions -ClaudeBinary (Join-Path $fixture 'claude.exe') -CodexBinary (Join-Path $fixture 'codex.exe') -ConfigPath (Join-Path $fixture 'settings\config.json')
+    Assert ((Get-AgentPurgeConfig $ctx).RetentionDays -eq 30 -and -not (Test-Path $ctx.ConfigPath)) 'Default retention is read without creating a config file'
+    Set-AgentPurgeRetention $ctx 45
+    Assert ((Get-AgentPurgeConfig $ctx).RetentionDays -eq 45) 'Retention setting persists in fixture config'
+    $invalidRetention = $false
+    try { Set-AgentPurgeRetention $ctx 0 } catch { $invalidRetention = $true }
+    Assert $invalidRetention 'Retention rejects zero days'
+    Set-Content -LiteralPath $ctx.ConfigPath -Value '{"retentionDays":"30"}'
+    $invalidConfig = $false
+    try { [void](Get-AgentPurgeConfig $ctx) } catch { $invalidConfig = $true }
+    Assert $invalidConfig 'Invalid saved config is rejected instead of using an unsafe retention'
+    Set-AgentPurgeRetention $ctx 45
     $ctx | Add-Member -NotePropertyName CurrentClaudeVersion -NotePropertyValue '2.1.319'
     $project = Join-Path $fixture 'work'
     $child = Join-Path $project 'nested'
@@ -213,6 +224,7 @@ c.close()
     $manifestFile = @(Get-ChildItem -LiteralPath (Join-Path $undoRoot 'runs') -Filter '*.json')[0].FullName
     $run = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
     Assert (-not (Test-Path $undoFile) -and -not (Test-Path $undoCache) -and $run.Entries.Count -eq 2) 'Undo run archives selected file and directory only'
+    Assert ($run.ExpiresAtUtc -and ([datetime]$run.ExpiresAtUtc - [datetime]$run.CreatedAtUtc).Days -eq 45) 'New run captures configured retention deadline'
     Assert ($script:keys.Count -eq 0 -and $run.Hash -eq (Get-UndoHash $run)) 'Keyboard confirmation creates a matching undo manifest'
     $badHashRejected = $false
     try { Invoke-UndoRestore $ctx $run.RunId ('0' * 64) | Out-Null } catch { $badHashRejected = $true }
@@ -344,6 +356,12 @@ c.close()
     Assert ($script:screen -match 'Nothing selected') 'Enter with no selection explains how to proceed'
     foreach ($key in @('DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
     Assert (((Show-StartMenu) -join ' ') -eq 'scan --global') 'Home menu arrow navigation chooses inspection'
+    foreach ($key in @('DownArrow', 'DownArrow', 'DownArrow', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    Assert (((Show-StartMenu) -join ' ') -eq 'settings') 'Home menu opens settings with arrow keys'
+    foreach ($key in @('UpArrow', 'Spacebar')) { $script:keys.Enqueue($key) }
+    Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 46) 'Keyboard settings save the adjusted retention'
+    foreach ($key in @('DownArrow', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Show-SettingsMenu $ctx) -eq 'Back' -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 46) 'Back leaves settings unchanged'
     foreach ($key in @('P', 'Escape')) { $script:keys.Enqueue($key) }
     $script:answers.Enqueue('')
     Assert (@(Show-StartMenu).Count -eq 0) 'Empty project path returns to home; Escape exits'
@@ -410,6 +428,12 @@ c.close()
     function New-AgentPurgeContext { return $ctx }
     Invoke-AgentPurge @('restore', $run.RunId, $run.Hash) | Out-Null
     Assert ((Test-Path $undoFile) -and (Test-Path $undoCache)) 'Restore command dispatch accepts a completed fixture run'
+    Assert (((Invoke-AgentPurge @('settings', 'show')) -join ' ') -match '46 days') 'Settings show command reads the saved value'
+    Invoke-AgentPurge @('settings', 'set', 'retention-days', '14') | Out-Null
+    Assert ((Get-AgentPurgeConfig $ctx).RetentionDays -eq 14 -and ([datetime]$run.ExpiresAtUtc - [datetime]$run.CreatedAtUtc).Days -eq 45) 'CLI setting changes future runs without altering an existing deadline'
+    $invalidSettingCommand = $false
+    try { Invoke-AgentPurge @('settings', 'set', 'retention-days', 'many') | Out-Null } catch { $invalidSettingCommand = $true }
+    Assert ($invalidSettingCommand -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 14) 'Settings command rejects nonnumeric retention without changing the file'
     Invoke-AgentPurge @()
     Assert ($script:homeMenuCount -eq 6) 'Empty command opens the home menu'
     function Test-InteractiveTerminal { return $false }
@@ -417,7 +441,7 @@ c.close()
     $readOnly = (Invoke-AgentPurge @('clean', '--all')) -join "`n"
     Assert ($null -eq $script:capturedSession -and $readOnly -match 'Read-only inventory' -and $readOnly -match 'By project' -and $readOnly -match 'incomplete') 'Redirected clean-all only prints inventory including incomplete-size context'
     Assert ($script:deletedIds.Count -eq 1 -and (Test-Path -LiteralPath $claudeFile)) 'UI and command tests never delete provider sessions'
-    Write-Output 'PASS: fixtures, sizes, project selection, keyboard-only cleanup, undo restore, command dispatch, install/update/uninstall.'
+    Write-Output 'PASS: fixtures, sizes, project selection, keyboard cleanup, retention settings, undo restore, command dispatch, install/update/uninstall.'
 } finally {
     $full = Get-FullPath $fixture
     $tempRoot = Get-FullPath $env:TEMP

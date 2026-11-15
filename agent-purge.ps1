@@ -22,7 +22,8 @@ function New-AgentPurgeContext {
         [string]$CodexPackages = '',
         [string]$ClaudeVersions = (Join-Path $env:USERPROFILE '.local\share\claude\versions'),
         [string]$ClaudeBinary = (Join-Path $env:USERPROFILE '.local\bin\claude.exe'),
-        [string]$CodexBinary = (Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin\codex.exe')
+        [string]$CodexBinary = (Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin\codex.exe'),
+        [string]$ConfigPath = (Join-Path $env:LOCALAPPDATA 'agent-purge\config.json')
     )
     if (-not $CodexPackages) { $CodexPackages = Join-Path $CodexRoot 'packages' }
     return [pscustomobject]@{
@@ -32,7 +33,32 @@ function New-AgentPurgeContext {
         ClaudeVersions = Get-FullPath $ClaudeVersions
         ClaudeBinary = Get-FullPath $ClaudeBinary
         CodexBinary = Get-FullPath $CodexBinary
+        ConfigPath = Get-FullPath $ConfigPath
     }
+}
+
+function Get-AgentPurgeConfig($Context) {
+    if (-not (Test-Path -LiteralPath $Context.ConfigPath)) {
+        return [pscustomobject]@{ RetentionDays = 30; Source = 'default' }
+    }
+    if (-not (Test-NoReparse $Context.ConfigPath)) { throw 'Unsafe Agent Purge config path' }
+    $saved = Get-Content -LiteralPath $Context.ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $saved.retentionDays -or $saved.retentionDays -isnot [int] -or $saved.retentionDays -lt 1 -or $saved.retentionDays -gt 365) {
+        throw 'Invalid retentionDays in Agent Purge config; expected an integer from 1 to 365'
+    }
+    return [pscustomobject]@{ RetentionDays = [int]$saved.retentionDays; Source = $Context.ConfigPath }
+}
+
+function Set-AgentPurgeRetention($Context, [int]$Days) {
+    if ($Days -lt 1 -or $Days -gt 365) { throw 'Retention days must be from 1 to 365' }
+    $path = $Context.ConfigPath
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $parent)) {
+        if (-not (Test-NoReparse (Split-Path -Parent $parent))) { throw 'Unsafe Agent Purge config parent' }
+        New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+    }
+    if (-not (Test-NoReparse $parent) -or ((Test-Path -LiteralPath $path) -and -not (Test-NoReparse $path))) { throw 'Unsafe Agent Purge config path' }
+    [IO.File]::WriteAllText($path, (@{retentionDays = $Days} | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
 }
 
 function Get-PathSize([string]$Path) {
@@ -566,6 +592,10 @@ function Get-UndoHash($Run) {
             [ordered]@{ Original = [string]$_.Original; Archived = [string]$_.Archived; Provider = [string]$_.Provider; Index = [int]$_.Index }
         })
     }
+    if ($Run.PSObject.Properties['CreatedAtUtc'] -and $Run.PSObject.Properties['ExpiresAtUtc']) {
+        $plan['CreatedAtUtc'] = [string]$Run.CreatedAtUtc
+        $plan['ExpiresAtUtc'] = [string]$Run.ExpiresAtUtc
+    }
     $bytes = [Text.Encoding]::UTF8.GetBytes(($plan | ConvertTo-Json -Compress -Depth 5))
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '') }
@@ -585,7 +615,12 @@ function New-UndoRun($Items, $Context) {
             })
         }
     }
-    $run = [pscustomobject]@{ RunId = $runId; Entries = $entries.ToArray(); Hash = '' }
+    $created = [DateTime]::UtcNow
+    $retention = (Get-AgentPurgeConfig $Context).RetentionDays
+    $run = [pscustomobject]@{
+        RunId = $runId; Entries = $entries.ToArray(); Hash = ''
+        CreatedAtUtc = $created.ToString('o'); ExpiresAtUtc = $created.AddDays($retention).ToString('o')
+    }
     $run.Hash = Get-UndoHash $run
     $manifestRoot = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
     foreach ($root in @($manifestRoot) + @($run.Entries | ForEach-Object { Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $_.Archived)) } | Select-Object -Unique)) {
@@ -1134,6 +1169,10 @@ Usage:
   agent-purge scan --project <path> Inspect sessions in a project and descendants
   agent-purge restore <run-id> <hash>
                                     Restore files saved in an Agent Purge undo run
+  agent-purge settings              View or change retention with keyboard controls
+  agent-purge settings show         Print the current retention setting
+  agent-purge settings set retention-days <1-365>
+                                    Set retention for future undo runs
   agent-purge install               Install a user-local launcher and PATH entry
   agent-purge update                Install the latest published main script
   agent-purge uninstall             Remove installed files and that PATH entry
@@ -1154,13 +1193,43 @@ Update refreshes the installed copy; to update a source checkout, pull main.
 '@ | Write-Output
 }
 
+function Show-SettingsMenu($Context) {
+    $saved = Get-AgentPurgeConfig $Context
+    $days = $saved.RetentionDays
+    while ($true) {
+        Clear-Host
+        Write-ScreenLine 'AGENT PURGE / SETTINGS' Cyan
+        Write-ScreenLine ('Undo retention: {0} days' -f $days)
+        Write-ScreenLine ('Saved setting: {0} days ({1})' -f $saved.RetentionDays, $saved.Source) DarkGray
+        Write-ScreenLine 'This value applies only to new undo runs; existing run deadlines stay fixed.'
+        Write-ScreenLine 'Up/Right +1 | Down/Left -1 | PgUp/PgDn +/-10 | Home 30'
+        Write-ScreenLine 'Enter/Space save | B/Backspace back | Esc/Ctrl+C twice quit'
+        $key = Read-MenuKey
+        switch ($key) {
+            'Escape' { return 'Exit' }
+            { $_ -in @('B', 'Backspace') } { return 'Back' }
+            { $_ -in @('UpArrow', 'RightArrow') } { $days = [math]::Min(365, $days + 1) }
+            { $_ -in @('DownArrow', 'LeftArrow') } { $days = [math]::Max(1, $days - 1) }
+            'PageUp' { $days = [math]::Min(365, $days + 10) }
+            'PageDown' { $days = [math]::Max(1, $days - 10) }
+            'Home' { $days = 30 }
+            { $_ -in @('Enter', 'Spacebar') } {
+                Set-AgentPurgeRetention $Context $days
+                Write-Host "Retention saved: $days days for new undo runs."
+                return 'Back'
+            }
+        }
+    }
+}
+
 function Show-StartMenu {
-    $labels = @('Choose projects to clean (recommended)', 'Inspect all agent storage', 'Clean all eligible storage', 'Choose one project folder', 'Exit')
+    $labels = @('Choose projects to clean (recommended)', 'Inspect all agent storage', 'Clean all eligible storage', 'Choose one project folder', 'Settings', 'Exit')
     $descriptions = @(
         'See project sizes, toggle projects with Space, then review cleanup with Enter.',
         'Browse providers and categories to understand storage and protected items.',
         'Preselect eligible sessions and logs. You can deselect before confirming cleanup.',
         'Limit session history to a project folder and its descendants.',
+        'View or change undo retention for future cleanup runs.',
         'Close Agent Purge without making further changes.'
     )
     $index = 0
@@ -1201,7 +1270,8 @@ function Show-StartMenu {
                 }
                 return @('clean', '--project', $path)
             }
-            4 { return }
+            4 { return @('settings') }
+            5 { return }
         }
     }
 }
@@ -1217,6 +1287,28 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'update') { [void](Update-AgentPurge); return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
+        if ($Arguments[0] -eq 'settings') {
+            $settingsContext = New-AgentPurgeContext
+            if ($Arguments.Count -eq 2 -and $Arguments[1] -eq 'show') {
+                $saved = Get-AgentPurgeConfig $settingsContext
+                Write-Output ("Undo retention: $($saved.RetentionDays) days ($($saved.Source)); future runs only.")
+                return
+            }
+            if ($Arguments.Count -eq 4 -and $Arguments[1] -eq 'set' -and $Arguments[2] -eq 'retention-days') {
+                [int]$days = 0
+                if (-not [int]::TryParse($Arguments[3], [ref]$days)) { throw 'Retention days must be an integer from 1 to 365' }
+                Set-AgentPurgeRetention $settingsContext $days
+                Write-Output "Undo retention saved: $days days for future runs."
+                return
+            }
+            if ($Arguments.Count -eq 1) {
+                if (-not (Test-InteractiveTerminal)) { throw 'Interactive settings require a terminal; use settings show or settings set.' }
+                if ((Show-SettingsMenu $settingsContext) -eq 'Exit') { return }
+                $fromMenu = $true
+                continue
+            }
+            throw 'Invalid settings command. Use --help.'
+        }
         if ($Arguments.Count -eq 3 -and $Arguments[0] -eq 'restore') {
             Invoke-UndoRestore (New-AgentPurgeContext) $Arguments[1] $Arguments[2]
             return
