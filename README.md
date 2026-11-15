@@ -14,9 +14,17 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\agent-purge.ps1 instal
 
 Open a new terminal, then run `agent-purge --help`. A private repository requires GitHub access configured for Git on this machine.
 
-Each interactive launch of the installed `agent-purge` checks the published `main` script on GitHub. If it differs from the installed copy, press **U** to install it or **S** to skip and continue. **U** replaces the installed copy with published `main`, including when the current copy came from newer unpublished local work. After updating, run `agent-purge` again to use the new version. If GitHub cannot be reached, the installed version continues to work. The check does not run for redirected input, `--help`, `install`, `uninstall`, or when running a source checkout directly.
+To update the installed command from published `main`, run:
 
-To update, pull the latest `main` branch in the same checkout and run `install` again:
+```powershell
+agent-purge update
+```
+
+This works without an interactive terminal. It verifies the installed files and downloaded PowerShell syntax before replacing the installed script. A failed download or check leaves the installed version in place and returns an error. Restart `agent-purge` to use the update. The command does not update a Git checkout or downloaded source file. Published `main` can be older than unpublished local work; `update` installs the published copy.
+
+Each interactive launch of the installed `agent-purge` also checks published `main`. If it differs from the installed copy, press **U** to install it or **S** to skip and continue. **U** replaces the installed copy with published `main`, including when the current copy came from newer unpublished local work. If GitHub cannot be reached, the installed version continues to work. The check does not run for redirected input, `--help`, `install`, `update`, `uninstall`, or when running a source checkout directly.
+
+To update a Git checkout as well, pull the latest `main` branch in that checkout and run `install` again:
 
 ```powershell
 Set-Location path\to\agent-purge
@@ -68,6 +76,7 @@ Uninstall preserves other files in the install directory and refuses to remove a
 | `agent-purge scan --global --advanced` | Also make verified old runtimes and provider cache entries selectable. |
 | `agent-purge scan --project <path>` | Inspect sessions whose recorded working directory is the path or a descendant. |
 | `agent-purge install` | Install the user-local launcher and PATH entry. |
+| `agent-purge update` | Update the installed command from published `main`. |
 | `agent-purge uninstall` | Remove the installed files and PATH entry. |
 | `agent-purge --help` | Print command and key help. |
 

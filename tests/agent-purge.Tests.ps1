@@ -228,19 +228,38 @@ c.close()
         $installedHash = (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash
         $markerHash = (Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json).scriptHash
         Assert ($installedHash -eq $markerHash -and $installedHash -eq (Get-FileHash -LiteralPath $remoteUpdate -Algorithm SHA256).Hash) 'Update refreshes script and install marker'
+        Assert (-not (Update-AgentPurge -InstallRoot $installRoot -PathScope Process)) 'Explicit update reports already current'
+        $directUpdate = Join-Path $fixture 'direct-agent-purge.ps1'
+        Set-Content -LiteralPath $directUpdate -Value '# direct update fixture'
+        $script:updateSource = $directUpdate
+        function Test-InteractiveTerminal { return $false }
+        Assert (Update-AgentPurge -InstallRoot $installRoot -PathScope Process) 'Explicit update works without an interactive terminal'
+        $installedHash = (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash
+        $markerHash = (Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json).scriptHash
+        Assert ($installedHash -eq $markerHash -and $installedHash -eq (Get-FileHash -LiteralPath $directUpdate -Algorithm SHA256).Hash) 'Explicit update refreshes script and marker'
+        function Test-InteractiveTerminal { return $true }
         $invalidUpdate = Join-Path $fixture 'invalid-agent-purge.ps1'
         Set-Content -LiteralPath $invalidUpdate -Value '{'
         $script:updateSource = $invalidUpdate
         Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Invalid downloaded script is rejected'
         Assert ((Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Invalid update preserves installed script'
+        $rejected = $false
+        try { [void](Update-AgentPurge -InstallRoot $installRoot -PathScope Process) } catch { $rejected = $true }
+        Assert ($rejected -and (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Explicit update rejects invalid script without changing installation'
         $script:updateSource = 'offline'
         Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Network failure continues with installed version'
         Assert ((Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Network failure preserves installed script'
+        $rejected = $false
+        try { [void](Update-AgentPurge -InstallRoot $installRoot -PathScope Process) } catch { $rejected = $true }
+        Assert ($rejected -and (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Explicit update reports download failure without changing installation'
         $requests = $script:updateRequests
         Add-Content -LiteralPath $installedScript -Value '# local edit'
         Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Changed installed script is not overwritten'
         Assert ($script:updateRequests -eq $requests) 'Changed installed script is checked before download'
-        Copy-Item -LiteralPath $remoteUpdate -Destination $installedScript -Force
+        $rejected = $false
+        try { [void](Update-AgentPurge -InstallRoot $installRoot -PathScope Process) } catch { $rejected = $true }
+        Assert ($rejected -and $script:updateRequests -eq $requests) 'Explicit update refuses changed installed script before download'
+        Copy-Item -LiteralPath $directUpdate -Destination $installedScript -Force
         function Test-InteractiveTerminal { return $false }
         Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Redirected input skips update check'
         $script:AgentPurgeScript = $originalSource
@@ -327,6 +346,10 @@ c.close()
     Assert ($script:capturedSession.ProjectPath -eq $project -and $script:scanRequests[-1].ProjectPath -eq $project) 'Project cleanup preserves its scan scope for refresh'
     Invoke-AgentPurge @('scan', '--global')
     Assert ($script:capturedSession.Selected.Count -eq 0) 'Scan never preselects items'
+    $script:explicitUpdateRequests = 0
+    function Update-AgentPurge { $script:explicitUpdateRequests++ }
+    Invoke-AgentPurge @('update')
+    Assert ($script:explicitUpdateRequests -eq 1) 'Update command dispatches without scanning or a terminal'
     $requestCount = $script:scanRequests.Count
     foreach ($invalid in @(@('clean', '--all', '--yes'), @('clean', '--project'), @('clean', '--all', '--project', $project), @('scan'), @('scan', '--global', '--wrong'))) {
         $rejected = $false

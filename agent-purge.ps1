@@ -856,12 +856,12 @@ function Install-AgentPurge {
     if ($PathScope -eq 'User') { Write-Host 'Open a new terminal to use agent-purge.' }
 }
 
-function Invoke-StartupUpdateCheck {
+function Update-AgentPurge {
     param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
-        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
+        [ValidateSet('User', 'Process')][string]$PathScope = 'User',
+        [switch]$Prompt)
     $root = Get-FullPath $InstallRoot
     $scriptFile = Join-Path $root 'agent-purge.ps1'
-    if (-not (Test-InteractiveTerminal) -or (Get-FullPath $script:AgentPurgeScript) -ne $scriptFile) { return $false }
     $download = Join-Path $env:TEMP ('agent-purge-update-' + [guid]::NewGuid().ToString('N') + '.ps1')
     try {
         $marker = Join-Path $root 'install.json'
@@ -874,25 +874,39 @@ function Invoke-StartupUpdateCheck {
             }
         }
         Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/Etriii/agent-purge/main/agent-purge.ps1' -OutFile $download -TimeoutSec 5 -ErrorAction Stop | Out-Null
-        if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -eq $record.scriptHash) { return $false }
+        if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -eq $record.scriptHash) {
+            if (-not $Prompt) { Write-Host 'Agent Purge is up to date.' }
+            return $false
+        }
         $tokens = $null; $parseErrors = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($download, [ref]$tokens, [ref]$parseErrors)
         if ($parseErrors.Count) { throw 'Downloaded update has invalid PowerShell syntax' }
-        Write-Host 'The published Agent Purge script on GitHub main differs from this installation.'
-        Write-Host 'U install published version | S skip and continue'
-        while ($true) {
-            $choice = Read-MenuKey
-            if ($choice -in @('S', 'Escape')) { return $false }
-            if ($choice -eq 'U') { break }
+        if ($Prompt) {
+            Write-Host 'The published Agent Purge script on GitHub main differs from this installation.'
+            Write-Host 'U install published version | S skip and continue'
+            while ($true) {
+                $choice = Read-MenuKey
+                if ($choice -in @('S', 'Escape')) { return $false }
+                if ($choice -eq 'U') { break }
+            }
         }
         Install-AgentPurge -InstallRoot $root -PathScope $PathScope -SourceFile $download | Out-Null
         Write-Host 'Update installed. Start agent-purge again to use the new version.'
         return $true
-    } catch {
-        Write-Host ('Update check failed: {0}. Continuing with the installed version.' -f $_.Exception.Message) -ForegroundColor Yellow
-        return $false
     } finally {
         if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force }
+    }
+}
+
+function Invoke-StartupUpdateCheck {
+    param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
+        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
+    $scriptFile = Join-Path (Get-FullPath $InstallRoot) 'agent-purge.ps1'
+    if (-not (Test-InteractiveTerminal) -or (Get-FullPath $script:AgentPurgeScript) -ne $scriptFile) { return $false }
+    try { return Update-AgentPurge -InstallRoot $InstallRoot -PathScope $PathScope -Prompt }
+    catch {
+        Write-Host ('Update check failed: {0}. Continuing with the installed version.' -f $_.Exception.Message) -ForegroundColor Yellow
+        return $false
     }
 }
 
@@ -933,6 +947,7 @@ Usage:
                                     Also allow verified old runtimes and caches
   agent-purge scan --project <path> Inspect sessions in a project and descendants
   agent-purge install               Install a user-local launcher and PATH entry
+  agent-purge update                Install the latest published main script
   agent-purge uninstall             Remove installed files and that PATH entry
   agent-purge --help                Show this help
 
@@ -943,7 +958,7 @@ Sizes show inventoried agent storage by project/provider/category, not source fo
 Clean --all never removes protected items and still requires typed confirmation.
 Redirected scan and clean commands only print inventory; they never remove data.
 Installed interactive launches offer an update from GitHub main when available.
-To update a source checkout: pull main and run install again.
+Update refreshes the installed copy; to update a source checkout, pull main.
 '@ | Write-Output
 }
 
@@ -1008,6 +1023,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($fromMenu) { $Arguments = @(Show-StartMenu); if (-not $Arguments.Count) { return } }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq '--help') { Show-AgentPurgeHelp; return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
+        if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'update') { [void](Update-AgentPurge); return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
         if ($Arguments[0] -notin @('scan', 'clean')) { throw 'Unknown command. Use --help.' }
         $clean = $Arguments[0] -eq 'clean'
