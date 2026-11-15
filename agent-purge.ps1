@@ -514,6 +514,10 @@ function Update-NavState($State, [string]$Key, $Rows) {
     switch ($Key) {
         'UpArrow' { if ($count) { $State.Index = ($State.Index + $count - 1) % $count } }
         'DownArrow' { if ($count) { $State.Index = ($State.Index + 1) % $count } }
+        'PageUp' { if ($count) { $State.Index = [math]::Max(0, $State.Index - (Get-PageSize 11)) } }
+        'PageDown' { if ($count) { $State.Index = [math]::Min($count - 1, $State.Index + (Get-PageSize 11)) } }
+        'Home' { if ($count) { $State.Index = 0 } }
+        'End' { if ($count) { $State.Index = $count - 1 } }
         'Enter' {
             if ($count -and $State.Level -lt 3) {
                 $State.History[$State.Level] = $State.Index
@@ -645,6 +649,18 @@ function Invoke-UndoMove([string]$Original, [string]$Archived) {
     $entry = Get-Item -LiteralPath $Original -Force -ErrorAction Stop
     if ($entry.PSIsContainer) { [IO.Directory]::Move($Original, $Archived) }
     else { [IO.File]::Move($Original, $Archived) }
+}
+
+function Invoke-UndoCompress([string]$Archived) {
+    $volume = [IO.Path]::GetPathRoot($Archived)
+    if (([IO.DriveInfo]::new($volume)).DriveFormat -ne 'NTFS' -or -not (Get-Command compact.exe -ErrorAction SilentlyContinue)) { return $false }
+    if (-not (Test-NoReparse $Archived $true)) { throw 'Unsafe archived path before compression' }
+    if (Test-Path -LiteralPath $Archived -PathType Container) {
+        & compact.exe /C /Q /A ('/S:' + $Archived) *> $null
+    } else {
+        & compact.exe /C /Q /A $Archived *> $null
+    }
+    return $LASTEXITCODE -eq 0
 }
 
 function Get-UndoExpiry($Run) {
@@ -805,7 +821,7 @@ function Invoke-CodexDeletion([string]$Id) {
     if ($LASTEXITCODE -ne 0) { throw "codex delete exited $LASTEXITCODE" }
 }
 
-function Read-CleanupChoice([string]$Heading, $Items, [string[]]$Options, [int]$DefaultIndex = 0, [string]$Description = '') {
+function Read-CleanupChoice([string]$Heading, $Items, [string[]]$Options, [int]$DefaultIndex = 0, [string]$Description = '', [string[]]$UndoRoots = @()) {
     $paths = @($Items | ForEach-Object {
         if ($_.Kind -eq 'CodexSession') { 'codex delete {0} | {1}' -f $_.Id, $_.Path }
         else { Get-ItemPaths $_ }
@@ -813,15 +829,17 @@ function Read-CleanupChoice([string]$Heading, $Items, [string[]]$Options, [int]$
     $summary = Get-InventorySummary $Items
     $index = $DefaultIndex; $page = 0
     while ($true) {
-        $pageSize = Get-PageSize (9 + $Options.Count)
+        $pageSize = Get-PageSize (9 + $Options.Count + $UndoRoots.Count)
         $pages = [math]::Max(1, [int][math]::Ceiling($paths.Count / $pageSize))
         $page = [math]::Min($page, $pages - 1)
         $start = $page * $pageSize
         $end = [math]::Min($paths.Count, $start + $pageSize)
         Clear-Host
         Write-ScreenLine ('AGENT PURGE / ' + $Heading) Cyan
-        Write-ScreenLine ('Selected: {0} items | {1} estimated logical size' -f $summary.Count, (Format-Bytes $summary.Bytes)) Cyan
+        $itemLabel = if ($summary.Count -eq 1) { 'item' } else { 'items' }
+        Write-ScreenLine ('Selected: {0} {1} | {2} estimated logical size' -f $summary.Count, $itemLabel, (Format-Bytes $summary.Bytes)) Cyan
         if ($Description) { Write-ScreenLine $Description Yellow }
+        foreach ($root in $UndoRoots) { Write-ScreenLine ("Undo folder: $root") Cyan }
         Write-ScreenLine ('Exact paths {0}-{1}/{2} | PgUp/PgDn browse | I show full paths' -f ($start + [int]($paths.Count -gt 0)), $end, $paths.Count) DarkGray
         for ($i = $start; $i -lt $end; $i++) { Write-ScreenLine ('  ' + $paths[$i]) }
         Write-ScreenLine ''
@@ -862,23 +880,24 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
     $before = Get-FreeSpace $selected
     if ($files.Count) {
         while ($true) {
-            $choice = Read-CleanupChoice 'CHOOSE FILE METHOD' $files @('Undo folder (recommended)', 'Recycle Bin', 'Permanent', 'Skip file batch', 'Back to selection') 0 'Undo keeps disk space; Recycle Bin is manual recovery; Permanent cannot be restored.'
+            $choice = Read-CleanupChoice 'CHOOSE FILE METHOD' $files @('Compressed undo folder (recommended)', 'Recycle Bin', 'Permanent', 'Keep files (skip this batch)', 'Back to selection') 0 'Undo uses NTFS compression when available; savings vary. Recycle Bin keeps space in use.'
             if ($choice -eq 'Exit') { return 'Exit' }
             if ($choice -in @('Back', 'Back to selection')) { return }
-            if ($choice -eq 'Skip file batch') { break }
-            $method = if ($choice -eq 'Undo folder (recommended)') { 'Undo folder' } else { $choice }
+            if ($choice -eq 'Keep files (skip this batch)') { break }
+            $method = if ($choice -eq 'Compressed undo folder (recommended)') { 'Undo folder' } else { $choice }
             foreach ($item in $files) {
                 $preview[$item.Key] = @(Get-ItemPaths $item)
             }
             if ($method -eq 'Permanent') {
-                $ack = Read-CleanupChoice 'PERMANENT FILE WARNING' $files @('Cancel file batch', 'I understand these files cannot be restored', 'Change file method') 0 'Permanent removal has no restore command or Recycle Bin recovery.'
+                $ack = Read-CleanupChoice 'PERMANENT FILE WARNING' $files @('Keep files (cancel this batch)', 'I understand these files cannot be restored', 'Change file method') 0 'Permanent removal has no restore command or Recycle Bin recovery.'
                 if ($ack -eq 'Exit') { return 'Exit' }
                 if ($ack -eq 'Back') { return }
                 if ($ack -eq 'Change file method') { continue }
                 if ($ack -ne 'I understand these files cannot be restored') { break }
             }
-            $action = if ($method -eq 'Undo folder') { 'Move to undo folder' } elseif ($method -eq 'Recycle Bin') { 'Move to Recycle Bin' } else { 'Delete files permanently' }
-            $answer = Read-CleanupChoice 'CONFIRM FILE CLEANUP' $files @('Cancel file batch', $action, 'Change file method') 0 ("Selected action: $action. Cancel is the default; Enter/Space on the action confirms.")
+            $action = if ($method -eq 'Undo folder') { 'Move to compressed undo folder' } elseif ($method -eq 'Recycle Bin') { 'Move to Recycle Bin' } else { 'Delete files permanently' }
+            $undoRoots = if ($method -eq 'Undo folder') { @( $files | ForEach-Object { Get-UndoRootForPath $_.Path $Context $_.Provider } | Sort-Object -Unique ) } else { @() }
+            $answer = Read-CleanupChoice 'CONFIRM FILE CLEANUP' $files @('Keep files (cancel this batch)', $action, 'Change file method') 0 ("Choose $action or keep these files. Codex is separate.") $undoRoots
             if ($answer -eq 'Exit') { return 'Exit' }
             if ($answer -eq 'Back') { return }
             if ($answer -eq 'Change file method') { continue }
@@ -918,7 +937,13 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
             foreach ($path in $was) {
                 try {
                     if (-not (Test-NoReparse $path $true)) { throw 'Reparse point or unreadable path' }
-                    if ($undoRun) { Invoke-UndoMove $path $undoPaths[(Get-FullPath $path)] }
+                    if ($undoRun) {
+                        $archived = $undoPaths[(Get-FullPath $path)]
+                        Invoke-UndoMove $path $archived
+                        try {
+                            if (-not (Invoke-UndoCompress $archived)) { Write-Host "NOTE Undo copy remains uncompressed: $archived" }
+                        } catch { Write-Host "NOTE Compression unavailable for $archived`: $($_.Exception.Message)" }
+                    }
                     else { Invoke-FileRemoval $path $method }
                     Write-Host "OK $method $path"
                 } catch { $itemFailed = $true; Write-Host "FAIL $path`: $($_.Exception.Message)" }
@@ -940,11 +965,20 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
     Write-Host ("Cleanup results: {0} succeeded, {1} skipped, {2} failed items." -f $succeeded, $skipped, $failed)
     if ($undoRun) {
         Write-Host ("Restore this run: agent-purge restore {0} {1}" -f $undoRun.RunId, $undoRun.Hash)
-        Write-Host 'Undo data still uses disk space. Codex deletions, if confirmed separately, are not part of this restore.'
+        foreach ($root in @($undoRun.Entries | ForEach-Object { Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $_.Archived)) } | Sort-Object -Unique)) {
+            Write-Host "Undo folder: $root"
+            Write-Host ("This run's stored files: {0}" -f (Join-Path (Join-Path $root 'payload') $undoRun.RunId))
+        }
+        Write-Host ("Undo manifest: {0}" -f (Join-Path (Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo\runs') ($undoRun.RunId + '.json')))
+        Write-Host 'Undo files still use disk space; NTFS compression may reduce it. Codex deletions are not part of this restore.'
     }
     $after = Get-FreeSpace $selected
     foreach ($root in $before.Keys) {
-        if ($after.ContainsKey($root)) { Write-Host ("Free space {0}: {1} -> {2}" -f $root, (Format-Bytes $before[$root]), (Format-Bytes $after[$root])) }
+        if ($after.ContainsKey($root)) {
+            $delta = [long]($after[$root] - $before[$root])
+            $change = if ($delta -ge 0) { '+' + (Format-Bytes $delta) } else { Format-Bytes $delta }
+            Write-Host ("Free space {0}: {1} -> {2} ({3})" -f $root, (Format-Bytes $before[$root]), (Format-Bytes $after[$root]), $change)
+        }
     }
     return $true
 }
@@ -983,7 +1017,51 @@ function Write-ScreenLine([string]$Text, [ConsoleColor]$Color = 'Gray') {
     $width = (Get-TerminalSize).Width
     $clean = [regex]::Replace($Text, '[\x00-\x1f\x7f-\x9f]', ' ')
     if ($clean.Length -ge $width) { $clean = $clean.Substring(0, $width - 4) + '...' }
+    if ($null -ne $script:MenuFrame) {
+        $script:MenuFrame.Add([pscustomobject]@{ Text = $clean; Color = $Color })
+        return
+    }
     Write-Host $clean -ForegroundColor $Color
+}
+
+function Show-MenuFrame {
+    $frame = $script:MenuFrame
+    $script:MenuFrame = $null
+    $size = Get-TerminalSize
+    $repaint = $false
+    try {
+        $repaint = -not [Console]::IsOutputRedirected -and $Host.Name -eq 'ConsoleHost' -and
+            [Console]::BufferWidth -ge $size.Width -and [Console]::WindowHeight -ge $frame.Count
+    } catch { }
+    if (-not $repaint) {
+        Clear-Host
+        foreach ($line in $frame) { Write-Host $line.Text -ForegroundColor $line.Color }
+        $script:PreviousMenuFrame = $null
+        return
+    }
+    try {
+        if ($null -eq $script:PreviousMenuFrame -or $script:PreviousMenuWidth -ne $size.Width) {
+            [Console]::Clear()
+            $script:PreviousMenuFrame = @()
+        }
+        $oldCount = @($script:PreviousMenuFrame).Count
+        for ($i = 0; $i -lt [math]::Max($frame.Count, $oldCount); $i++) {
+            $line = if ($i -lt $frame.Count) { $frame[$i] } else { [pscustomobject]@{ Text = ''; Color = [ConsoleColor]::Gray } }
+            if ($i -lt $oldCount -and $line.Text -ceq $script:PreviousMenuFrame[$i].Text -and $line.Color -eq $script:PreviousMenuFrame[$i].Color) { continue }
+            [Console]::SetCursorPosition(0, $i)
+            [Console]::ForegroundColor = $line.Color
+            [Console]::Write($line.Text.PadRight($size.Width - 1))
+        }
+        [Console]::ResetColor()
+        [Console]::SetCursorPosition(0, [math]::Min($frame.Count, $size.Height - 1))
+        $script:PreviousMenuFrame = @($frame.ToArray())
+        $script:PreviousMenuWidth = $size.Width
+    } catch {
+        [Console]::ResetColor()
+        $script:PreviousMenuFrame = $null
+        Clear-Host
+        foreach ($line in $frame) { Write-Host $line.Text -ForegroundColor $line.Color }
+    }
 }
 
 function Format-ProjectLabel([string]$Label, [int]$Width) {
@@ -1030,10 +1108,13 @@ function Invoke-SelectionCleanup($Session) {
 function Invoke-ProjectPicker($Session) {
     $index = 0
     $notice = ''
+    $groups = @(Get-ProjectGroups $Session.Items)
+    $breakdowns = @{}
+    foreach ($group in $groups) { $breakdowns[$group.Key] = @((Format-SizeDistribution $group.Items Provider)) + @((Format-SizeDistribution $group.Items Category)) }
+    $script:PreviousMenuFrame = $null
     while ($true) {
-        $groups = @(Get-ProjectGroups $Session.Items)
         $index = [math]::Min($index, [math]::Max(0, $groups.Count - 1))
-        Clear-Host
+        $script:MenuFrame = New-Object 'System.Collections.Generic.List[object]'
         $mode = if ($Session.Advanced) { ' / ADVANCED' } else { '' }
         Write-ScreenLine ('AGENT PURGE / CHOOSE PROJECTS TO CLEAN' + $mode) Cyan
         Write-ScreenLine 'Which projects have agent history you no longer need?'
@@ -1044,9 +1125,9 @@ function Invoke-ProjectPicker($Session) {
         $breakdown = @()
         if ($groups.Count) {
             $focus = $groups[$index]
-            $breakdown = @((Format-SizeDistribution $focus.Items Provider)) + @((Format-SizeDistribution $focus.Items Category))
+            $breakdown = $breakdowns[$focus.Key]
         }
-        $limit = Get-PageSize (15 + $breakdown.Count)
+        $limit = Get-PageSize (16 + $breakdown.Count)
         $start = [math]::Max(0, $index - $limit + 1)
         for ($i = $start; $i -lt [math]::Min($groups.Count, $start + $limit); $i++) {
             $group = $groups[$i]
@@ -1065,15 +1146,30 @@ function Invoke-ProjectPicker($Session) {
             foreach ($line in $breakdown) { Write-ScreenLine ('  ' + $line) }
         }
         Write-ScreenLine $notice Yellow
-        Write-ScreenLine 'Up/Down move | Space toggle | A select/clear all | I inspect'
+        Write-ScreenLine 'Up/Down move | PgUp/PgDn jump | Home/End ends | Space toggle'
+        Write-ScreenLine 'F find project | A select/clear all | I inspect'
         Write-ScreenLine 'Enter review cleanup | B/Backspace back | Esc/Ctrl+C twice quit'
+        Show-MenuFrame
         $notice = ''
         $key = Read-MenuKey
         switch ($key) {
-            'Escape' { return 'Exit' }
-            { $_ -in @('B', 'Backspace') } { return 'Back' }
+            'Escape' { $script:PreviousMenuFrame = $null; return 'Exit' }
+            { $_ -in @('B', 'Backspace') } { $script:PreviousMenuFrame = $null; return 'Back' }
             'UpArrow' { if ($groups.Count) { $index = ($index + $groups.Count - 1) % $groups.Count } }
             'DownArrow' { if ($groups.Count) { $index = ($index + 1) % $groups.Count } }
+            'PageUp' { $index = [math]::Max(0, $index - (Get-PageSize (16 + $breakdown.Count))) }
+            'PageDown' { $index = [math]::Min([math]::Max(0, $groups.Count - 1), $index + (Get-PageSize (16 + $breakdown.Count))) }
+            'Home' { $index = 0 }
+            'End' { $index = [math]::Max(0, $groups.Count - 1) }
+            'F' {
+                $query = (Read-Host 'Find project name or path').Trim()
+                $script:PreviousMenuFrame = $null
+                if ($query) {
+                    $match = @($groups | Where-Object { $_.Label.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | Select-Object -First 1)
+                    if ($match.Count) { $index = [array]::IndexOf($groups, $match[0]) }
+                    else { $notice = 'No project matches that search.' }
+                }
+            }
             'Spacebar' {
                 if ($groups.Count) {
                     Switch-ItemSelection $groups[$index].Items $Session.Selected
@@ -1083,10 +1179,15 @@ function Invoke-ProjectPicker($Session) {
             'A' { Switch-ItemSelection $Session.Items $Session.Selected }
             { $_ -in @('I', 'RightArrow') } {
                 if ($groups.Count -and (Invoke-InventoryUI $Session $groups[$index].Key) -eq 'Exit') { return 'Exit' }
+                $script:PreviousMenuFrame = $null
             }
             { $_ -in @('Enter', 'D') } {
                 if (@(Get-SelectedItems $Session.Items $Session.Selected).Count) {
                     if ((Invoke-SelectionCleanup $Session) -eq 'Exit') { return 'Exit' }
+                    $groups = @(Get-ProjectGroups $Session.Items)
+                    $breakdowns = @{}
+                    foreach ($group in $groups) { $breakdowns[$group.Key] = @((Format-SizeDistribution $group.Items Provider)) + @((Format-SizeDistribution $group.Items Category)) }
+                    $script:PreviousMenuFrame = $null
                 }
                 else { $notice = 'Nothing selected. Use Space on a project, or A to select all eligible items.' }
             }
@@ -1130,7 +1231,7 @@ function Invoke-InventoryUI($Session, [string]$GroupKey = '') {
             } else { Write-ScreenLine 'This item is no longer in the inventory. Use B to go back.' }
         } elseif (-not $rows.Count) { Write-Host 'No items.' }
         else {
-            $limit = Get-PageSize 10
+            $limit = Get-PageSize 11
             $start = [math]::Max(0, $state.Index - $limit + 1)
             for ($i = $start; $i -lt [math]::Min($rows.Count, $start + $limit); $i++) {
                 $mark = if ($i -eq $state.Index) { '>' } else { ' ' }
@@ -1150,7 +1251,8 @@ function Invoke-InventoryUI($Session, [string]$GroupKey = '') {
             Write-ScreenLine ('Row {0}/{1} | Focused: {2} items, {3} eligible' -f ($state.Index + 1), $rows.Count, $focusedItems.Count, (Format-Bytes (Get-InventorySummary $focusedItems).EligibleBytes)) DarkGray
         }
         Write-ScreenLine $notice Yellow
-        Write-ScreenLine 'Up/Down move | Enter open | Space toggle | A select/clear this view'
+        Write-ScreenLine 'Up/Down move | PgUp/PgDn jump | Home/End ends | Enter open'
+        Write-ScreenLine 'Space toggle | A select/clear this view'
         Write-ScreenLine 'D review cleanup | C copy resume | B/Backspace back | Esc/Ctrl+C twice quit'
         $notice = ''
         $key = Read-MenuKey
@@ -1201,8 +1303,7 @@ function Install-AgentPurge {
 
 function Update-AgentPurge {
     param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
-        [ValidateSet('User', 'Process')][string]$PathScope = 'User',
-        [switch]$Prompt)
+        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
     $root = Get-FullPath $InstallRoot
     $scriptFile = Join-Path $root 'agent-purge.ps1'
     $download = Join-Path $env:TEMP ('agent-purge-update-' + [guid]::NewGuid().ToString('N') + '.ps1')
@@ -1218,38 +1319,17 @@ function Update-AgentPurge {
         }
         Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/Etriii/agent-purge/main/agent-purge.ps1' -OutFile $download -TimeoutSec 5 -ErrorAction Stop | Out-Null
         if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -eq $record.scriptHash) {
-            if (-not $Prompt) { Write-Host 'Agent Purge is up to date.' }
+            Write-Host 'Agent Purge is up to date.'
             return $false
         }
         $tokens = $null; $parseErrors = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($download, [ref]$tokens, [ref]$parseErrors)
         if ($parseErrors.Count) { throw 'Downloaded update has invalid PowerShell syntax' }
-        if ($Prompt) {
-            Write-Host 'The published Agent Purge script on GitHub main differs from this installation.'
-            Write-Host 'U install published version | S skip and continue'
-            while ($true) {
-                $choice = Read-MenuKey
-                if ($choice -in @('S', 'Escape')) { return $false }
-                if ($choice -eq 'U') { break }
-            }
-        }
         Install-AgentPurge -InstallRoot $root -PathScope $PathScope -SourceFile $download | Out-Null
         Write-Host 'Update installed. Start agent-purge again to use the new version.'
         return $true
     } finally {
         if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force }
-    }
-}
-
-function Invoke-StartupUpdateCheck {
-    param([string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'Programs\agent-purge'),
-        [ValidateSet('User', 'Process')][string]$PathScope = 'User')
-    $scriptFile = Join-Path (Get-FullPath $InstallRoot) 'agent-purge.ps1'
-    if (-not (Test-InteractiveTerminal) -or (Get-FullPath $script:AgentPurgeScript) -ne $scriptFile) { return $false }
-    try { return Update-AgentPurge -InstallRoot $InstallRoot -PathScope $PathScope -Prompt }
-    catch {
-        Write-Host ('Update check failed: {0}. Continuing with the installed version.' -f $_.Exception.Message) -ForegroundColor Yellow
-        return $false
     }
 }
 
@@ -1279,7 +1359,7 @@ function Show-AgentPurgeHelp {
 Agent Purge: inspect and selectively clean local Codex and Claude storage.
 
 Usage:
-  agent-purge                       Check for updates, then open the guided menu
+  agent-purge                       Open the guided menu
   agent-purge clean                 Choose projects with Space, then Enter to review
   agent-purge clean --all           Preselect all eligible storage; review before deletion
   agent-purge clean --all --advanced
@@ -1300,10 +1380,12 @@ Usage:
   agent-purge uninstall             Remove installed files and that PATH entry
   agent-purge --help                Show this help
 
-Project picker: Up/Down move, Space toggle, A select/clear all, Enter review,
-I inspect. Inspector: Enter open, D review, C copy resume from details.
+Project picker: Up/Down move, PgUp/PgDn jump, Home/End ends, F find,
+Space toggle, A select/clear all, Enter review, I inspect.
+Inspector: Enter open, D review, C copy resume from details.
 B/Backspace goes back; Esc or Ctrl+C twice quits. [x] selected, [~] partial, [-] inspect only.
-Undo folder keeps files for run-based restore; Recycle Bin needs manual restore.
+Undo folder uses NTFS compression when available and prints its location.
+Small or already compressed files may save little space. Recycle Bin needs manual restore.
 Expired runs move to a named Recycle Bin folder on the next interactive launch.
 At file cleanup: Up/Down choose; Enter/Space select. PgUp/PgDn browse paths; I shows full paths.
 Codex sessions use separate permanent deletion and cannot be restored by this command.
@@ -1404,7 +1486,6 @@ function Invoke-AgentPurge([string[]]$Arguments) {
     $fromMenu = -not $Arguments.Count
     $expiryChecked = $false
     if ($fromMenu -and -not (Test-InteractiveTerminal)) { Show-AgentPurgeHelp; return }
-    if ($fromMenu -and (Invoke-StartupUpdateCheck)) { return }
     do {
         if ($fromMenu) {
             if (-not $expiryChecked) {
@@ -1459,7 +1540,6 @@ function Invoke-AgentPurge([string[]]$Arguments) {
             if (-not (Test-Path -LiteralPath $Arguments[2] -PathType Container)) { throw "Project directory not found: $($Arguments[2])" }
             $project = (Get-Item -LiteralPath $Arguments[2]).FullName
         } else { throw 'Invalid arguments. Use --help.' }
-        if (-not $fromMenu -and (Invoke-StartupUpdateCheck)) { return }
         $context = New-AgentPurgeContext
         $items = @(Get-ScanInventory $context $advanced $project)
         if (-not (Test-InteractiveTerminal)) {

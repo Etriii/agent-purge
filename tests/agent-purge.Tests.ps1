@@ -117,6 +117,14 @@ c.close()
     $state = Update-NavState $state 'Enter' @('Claude','Codex')
     $state = Update-NavState $state 'B' @('Sessions')
     Assert ($state.Level -eq 0 -and $state.Index -eq 1) 'B is a back shortcut'
+    $manyRows = @(1..40)
+    $state = Update-NavState $state 'Home' $manyRows
+    $state = Update-NavState $state 'PageDown' $manyRows
+    Assert ($state.Index -eq (Get-PageSize 11)) 'Inspector PageDown moves one visible screen'
+    $state = Update-NavState $state 'End' $manyRows
+    Assert ($state.Index -eq 39) 'Inspector End moves to the last row'
+    $state = Update-NavState $state 'PageUp' $manyRows
+    Assert ($state.Index -eq (39 - (Get-PageSize 11))) 'Inspector PageUp moves one visible screen'
     $selected = @{}; $selected[$matched[0].Key] = $true; $selected[$matched[1].Key] = $true
     Assert (@(Get-SelectedItems $matched $selected).Count -eq 2) 'Multiselection persists'
     Assert (-not (Test-SafeItem $matched[0] $ctx)) 'Session safety check'
@@ -212,18 +220,24 @@ c.close()
     Invoke-Cleanup @(($matched | Where-Object Id -eq $cid)) $ctx | Out-Null
     Assert ($script:deletedIds.Count -eq 1 -and $script:deletedIds[0] -eq $cid) 'Separate Codex confirmation'
     $undoFile = Join-Path $claudeRoot 'debug\undo.txt'
-    Set-Content -LiteralPath $undoFile -Value 'undo content'
+    $undoContent = 'undo content' * 12000
+    [IO.File]::WriteAllText($undoFile, $undoContent)
     $undoCache = Join-Path $claudeRoot 'cache\undo-folder'
     New-Item -ItemType Directory -Path $undoCache | Out-Null
-    Set-Content -LiteralPath (Join-Path $undoCache 'child.txt') -Value 'cache content'
+    [IO.File]::WriteAllText((Join-Path $undoCache 'child.txt'), ('cache content' * 12000))
     $undoLogItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $undoFile '' '' '' '' '' '' $true
     $undoCacheItem = New-InventoryItem $ctx 'Claude' 'Caches' 'Cache' $undoCache '' '' '' '' '' '' $true
     foreach ($key in @('Enter', 'Enter', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
-    Invoke-Cleanup @($undoLogItem, $undoCacheItem) $ctx $true | Out-Null
+    $undoOutput = @(Invoke-Cleanup @($undoLogItem, $undoCacheItem) $ctx $true 6>&1)
     $undoRoot = Join-Path $fixture '.agent-purge-undo'
     $manifestFile = @(Get-ChildItem -LiteralPath (Join-Path $undoRoot 'runs') -Filter '*.json')[0].FullName
     $run = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
     Assert (-not (Test-Path $undoFile) -and -not (Test-Path $undoCache) -and $run.Entries.Count -eq 2) 'Undo run archives selected file and directory only'
+    if (([IO.DriveInfo]::new([IO.Path]::GetPathRoot($undoFile))).DriveFormat -eq 'NTFS' -and (Get-Command compact.exe -ErrorAction SilentlyContinue)) {
+        Assert (((Get-Item -LiteralPath $run.Entries[0].Archived -Force).Attributes -band [IO.FileAttributes]::Compressed) -ne 0) 'Undo file uses NTFS compression'
+        Assert (((Get-Item -LiteralPath (Join-Path $run.Entries[1].Archived 'child.txt') -Force).Attributes -band [IO.FileAttributes]::Compressed) -ne 0) 'Undo directory contents use NTFS compression'
+    }
+    Assert (($undoOutput -join "`n") -match 'Undo folder:' -and ($undoOutput -join "`n") -match "This run's stored files:") 'Cleanup shows the undo location'
     Assert ($run.ExpiresAtUtc -and ([datetime]$run.ExpiresAtUtc - [datetime]$run.CreatedAtUtc).Days -eq 45) 'New run captures configured retention deadline'
     Assert ($script:keys.Count -eq 0 -and $run.Hash -eq (Get-UndoHash $run)) 'Keyboard confirmation creates a matching undo manifest'
     $badHashRejected = $false
@@ -241,7 +255,7 @@ c.close()
     Assert ((Get-Content $undoFile -Raw) -match 'new data' -and (Test-Path $undoCache)) 'Restore does not overwrite an occupied original path and continues other entries'
     Remove-Item -LiteralPath $undoFile -Force
     Invoke-UndoRestore $ctx $run.RunId $run.Hash | Out-Null
-    Assert ((Get-Content $undoFile -Raw) -match 'undo content' -and (Get-Content (Join-Path $undoCache 'child.txt') -Raw) -match 'cache content') 'Restore recovers archived file and directory'
+    Assert ((Get-Content $undoFile -Raw) -eq $undoContent -and (Get-Content (Join-Path $undoCache 'child.txt') -Raw) -eq ('cache content' * 12000)) 'Restore recovers compressed file and directory contents'
     $recycleConfirmFile = Join-Path $claudeRoot 'debug\recycle-confirm.txt'
     Set-Content -LiteralPath $recycleConfirmFile -Value 'recycle content'
     $recycleConfirmItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $recycleConfirmFile '' '' '' '' '' '' $true
@@ -262,27 +276,19 @@ c.close()
         $pathEntries = @([Environment]::GetEnvironmentVariable('Path', 'Process') -split ';' | Where-Object { $_ -eq $installRoot })
         Assert ($pathEntries.Count -eq 1) 'Update keeps one PATH entry'
         $installedScript = Join-Path $installRoot 'agent-purge.ps1'
-        $script:AgentPurgeScript = $installedScript
         $script:updateSource = $updatedSource
         $script:updateRequests = 0
-        $script:updateKeys = New-Object 'System.Collections.Generic.Queue[string]'
-        function Test-InteractiveTerminal { return $true }
-        function Read-MenuKey { return $script:updateKeys.Dequeue() }
         function Invoke-WebRequest {
             param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile, [int]$TimeoutSec, $ErrorAction)
             $script:updateRequests++
             if ($script:updateSource -eq 'offline') { throw 'Network unavailable' }
             Copy-Item -LiteralPath $script:updateSource -Destination $OutFile
         }
-        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Matching remote script needs no update'
+        Assert (-not (Update-AgentPurge -InstallRoot $installRoot -PathScope Process)) 'Matching published script needs no update'
         $remoteUpdate = Join-Path $fixture 'remote-agent-purge.ps1'
         Set-Content -LiteralPath $remoteUpdate -Value '# newer fixture'
         $script:updateSource = $remoteUpdate
-        $script:updateKeys.Enqueue('S')
-        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Skip continues without updating'
-        Assert ((Get-Content -LiteralPath $installedScript -Raw) -match 'update fixture') 'Skip preserves installed script'
-        $script:updateKeys.Enqueue('U')
-        Assert (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process) 'Update choice installs downloaded script'
+        Assert (Update-AgentPurge -InstallRoot $installRoot -PathScope Process) 'Explicit update installs published script'
         $installedHash = (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash
         $markerHash = (Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json).scriptHash
         Assert ($installedHash -eq $markerHash -and $installedHash -eq (Get-FileHash -LiteralPath $remoteUpdate -Algorithm SHA256).Hash) 'Update refreshes script and install marker'
@@ -295,35 +301,23 @@ c.close()
         $installedHash = (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash
         $markerHash = (Get-Content -LiteralPath (Join-Path $installRoot 'install.json') -Raw | ConvertFrom-Json).scriptHash
         Assert ($installedHash -eq $markerHash -and $installedHash -eq (Get-FileHash -LiteralPath $directUpdate -Algorithm SHA256).Hash) 'Explicit update refreshes script and marker'
-        function Test-InteractiveTerminal { return $true }
         $invalidUpdate = Join-Path $fixture 'invalid-agent-purge.ps1'
         Set-Content -LiteralPath $invalidUpdate -Value '{'
         $script:updateSource = $invalidUpdate
-        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Invalid downloaded script is rejected'
-        Assert ((Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Invalid update preserves installed script'
         $rejected = $false
         try { [void](Update-AgentPurge -InstallRoot $installRoot -PathScope Process) } catch { $rejected = $true }
         Assert ($rejected -and (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Explicit update rejects invalid script without changing installation'
         $script:updateSource = 'offline'
-        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Network failure continues with installed version'
-        Assert ((Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Network failure preserves installed script'
         $rejected = $false
         try { [void](Update-AgentPurge -InstallRoot $installRoot -PathScope Process) } catch { $rejected = $true }
         Assert ($rejected -and (Get-FileHash -LiteralPath $installedScript -Algorithm SHA256).Hash -eq $installedHash) 'Explicit update reports download failure without changing installation'
         $requests = $script:updateRequests
         Add-Content -LiteralPath $installedScript -Value '# local edit'
-        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Changed installed script is not overwritten'
-        Assert ($script:updateRequests -eq $requests) 'Changed installed script is checked before download'
         $rejected = $false
         try { [void](Update-AgentPurge -InstallRoot $installRoot -PathScope Process) } catch { $rejected = $true }
         Assert ($rejected -and $script:updateRequests -eq $requests) 'Explicit update refuses changed installed script before download'
         Copy-Item -LiteralPath $directUpdate -Destination $installedScript -Force
-        function Test-InteractiveTerminal { return $false }
-        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Redirected input skips update check'
         $script:AgentPurgeScript = $originalSource
-        function Test-InteractiveTerminal { return $true }
-        Assert (-not (Invoke-StartupUpdateCheck -InstallRoot $installRoot -PathScope Process)) 'Source checkout skips installed update check'
-        Assert ($script:updateRequests -eq $requests) 'Skipped checks do not contact GitHub'
         Uninstall-AgentPurge -InstallRoot $installRoot -PathScope Process | Out-Null
         Assert (-not (Test-Path $installRoot)) 'Uninstall files'
         Assert (-not ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot))) 'Uninstall PATH'
@@ -347,6 +341,22 @@ c.close()
     Assert ($script:keys.Count -eq 0 -and $script:answers.Count -eq 0) 'Menu flow consumes the expected input only'
     foreach ($key in @('LeftArrow', 'DownArrow', 'UpArrow', 'Escape')) { $script:keys.Enqueue($key) }
     Assert ((Invoke-ProjectPicker $ui) -eq 'Exit' -and $script:keys.Count -eq 0) 'Picker arrows stay in selection until Escape'
+    $jumpUI = [pscustomobject]@{Items=$all;Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
+    $orderedGroups = @(Get-ProjectGroups $all)
+    foreach ($key in @('End', 'Spacebar', 'Home', 'Spacebar', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $jumpUI) -eq 'Back') 'Home and End navigate the project checklist'
+    foreach ($item in @($orderedGroups[0].Items) + @($orderedGroups[-1].Items)) {
+        if ($item.Eligible) { Assert ($jumpUI.Selected.ContainsKey($item.Key)) 'Home and End select the intended projects' }
+    }
+    foreach ($key in @('PageDown', 'PageUp', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $jumpUI) -eq 'Back' -and $script:keys.Count -eq 0) 'Page keys move through the project checklist'
+    $findUI = [pscustomobject]@{Items=$all;Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
+    $script:answers.Enqueue($orderedGroups[-1].Label)
+    foreach ($key in @('F', 'Spacebar', 'B')) { $script:keys.Enqueue($key) }
+    Assert ((Invoke-ProjectPicker $findUI) -eq 'Back' -and $script:answers.Count -eq 0) 'Project search consumes a path query'
+    foreach ($item in $orderedGroups[-1].Items) {
+        if ($item.Eligible) { Assert ($findUI.Selected.ContainsKey($item.Key)) 'Project search focuses the matching project' }
+    }
     foreach ($key in @('A', 'Escape')) { $script:keys.Enqueue($key) }
     Assert ((Invoke-ProjectPicker $ui) -eq 'Exit') 'Escape exits the picker'
     Assert ($ui.Selected.Count -eq 3) 'A selects all eligible projects from partial selection'
@@ -435,7 +445,7 @@ c.close()
     try { Invoke-AgentPurge @('settings', 'set', 'retention-days', 'many') | Out-Null } catch { $invalidSettingCommand = $true }
     Assert ($invalidSettingCommand -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 14) 'Settings command rejects nonnumeric retention without changing the file'
     Invoke-AgentPurge @()
-    Assert ($script:homeMenuCount -eq 6) 'Empty command opens the home menu'
+    Assert ($script:homeMenuCount -eq 6 -and $script:updateRequests -eq $requests) 'Opening the home menu does not contact GitHub'
     function Test-InteractiveTerminal { return $false }
     $script:capturedSession = $null
     $readOnly = (Invoke-AgentPurge @('clean', '--all')) -join "`n"
