@@ -399,6 +399,7 @@ c.close()
         $script:scanRequests += [pscustomobject]@{Advanced=$Advanced;ProjectPath=$ProjectPath}
         return $script:scanItems
     }
+    function New-AgentPurgeContext { return $ctx }
     function Invoke-ProjectPicker { param($Session) $script:capturedSession = $Session; return 'Back' }
     function Invoke-InventoryUI { param($Session) $script:capturedSession = $Session; return 'Back' }
     $script:homeMenuCount = 0
@@ -425,7 +426,6 @@ c.close()
         Assert $rejected ('Reject unsupported or conflicting arguments: ' + ($invalid -join ' '))
     }
     Assert ($script:scanRequests.Count -eq $requestCount) 'Invalid commands fail before scanning'
-    function New-AgentPurgeContext { return $ctx }
     Invoke-AgentPurge @('restore', $run.RunId, $run.Hash) | Out-Null
     Assert ((Test-Path $undoFile) -and (Test-Path $undoCache)) 'Restore command dispatch accepts a completed fixture run'
     Assert (((Invoke-AgentPurge @('settings', 'show')) -join ' ') -match '46 days') 'Settings show command reads the saved value'
@@ -441,7 +441,55 @@ c.close()
     $readOnly = (Invoke-AgentPurge @('clean', '--all')) -join "`n"
     Assert ($null -eq $script:capturedSession -and $readOnly -match 'Read-only inventory' -and $readOnly -match 'By project' -and $readOnly -match 'incomplete') 'Redirected clean-all only prints inventory including incomplete-size context'
     Assert ($script:deletedIds.Count -eq 1 -and (Test-Path -LiteralPath $claudeFile)) 'UI and command tests never delete provider sessions'
-    Write-Output 'PASS: fixtures, sizes, project selection, keyboard cleanup, retention settings, undo restore, command dispatch, install/update/uninstall.'
+    $expiryFile = Join-Path $claudeRoot 'debug\expire.txt'
+    Set-Content -LiteralPath $expiryFile -Value 'expires'
+    $expiryItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $expiryFile '' '' '' '' '' '' $true
+    $expiryRun = New-UndoRun @($expiryItem) $ctx
+    Invoke-UndoMove $expiryFile $expiryRun.Entries[0].Archived
+    $expiryRun.ExpiresAtUtc = [datetimeoffset]::UtcNow.AddMinutes(-1).ToString('o')
+    $expiryRun.Hash = Get-UndoHash $expiryRun
+    $expiryManifest = Join-Path (Join-Path $undoRoot 'runs') ($expiryRun.RunId + '.json')
+    [IO.File]::WriteAllText($expiryManifest, ($expiryRun | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+    $script:recycled = New-Object 'System.Collections.Generic.List[string]'
+    $script:failRecycle = $true
+    function Invoke-FileRemoval {
+        param([string]$Path, [string]$Method)
+        Assert ($Method -eq 'Recycle Bin' -and (Split-Path -Leaf $Path) -match '^agent-purge-.+-[0-9A-F]{12}$') 'Expiry sends a named run folder to Recycle Bin'
+        if ($script:failRecycle) { $script:failRecycle = $false; throw 'Simulated Recycle Bin failure' }
+        $target = Join-Path (Join-Path $fixture 'recycled') (Split-Path -Leaf $Path)
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        [IO.Directory]::Move($Path, $target)
+        $script:recycled.Add($target)
+    }
+    Invoke-ExpiredUndoRuns $ctx
+    $named = Join-Path (Join-Path $undoRoot 'payload') ('agent-purge-' + $expiryRun.RunId + '-' + $expiryRun.Hash.Substring(0, 12))
+    Assert ((Test-Path $named) -and $script:recycled.Count -eq 0) 'Failed Recycle Bin move retains the named undo folder for retry'
+    Invoke-ExpiredUndoRuns $ctx
+    Assert ($script:recycled.Count -eq 1 -and -not (Test-Path $named) -and (Test-Path (Join-Path $script:recycled[0] 'agent-purge-manifest.json'))) 'Expiry retries and recycles one folder with its manifest'
+    $expiredRestoreRejected = $false
+    try { Invoke-UndoRestore $ctx $expiryRun.RunId $expiryRun.Hash | Out-Null } catch { $expiredRestoreRejected = $true }
+    Assert ($expiredRestoreRejected -and -not (Test-Path $expiryFile)) 'Expired restore command refuses the run'
+    $legacyFile = Join-Path $claudeRoot 'debug\legacy.txt'
+    Set-Content -LiteralPath $legacyFile -Value 'legacy'
+    $legacyItem = New-InventoryItem $ctx 'Claude' 'Logs' 'Log' $legacyFile '' '' '' '' '' '' $true
+    $legacyRun = New-UndoRun @($legacyItem) $ctx
+    Invoke-UndoMove $legacyFile $legacyRun.Entries[0].Archived
+    $legacyRun.PSObject.Properties.Remove('CreatedAtUtc'); $legacyRun.PSObject.Properties.Remove('ExpiresAtUtc')
+    $legacyRun.Hash = Get-UndoHash $legacyRun
+    $legacyManifest = Join-Path (Join-Path $undoRoot 'runs') ($legacyRun.RunId + '.json')
+    [IO.File]::WriteAllText($legacyManifest, ($legacyRun | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+    Invoke-ExpiredUndoRuns $ctx ([datetimeoffset]::UtcNow.AddYears(2))
+    Assert ($script:recycled.Count -eq 1 -and (Test-Path $legacyRun.Entries[0].Archived)) 'Legacy runs without a deadline are not expired'
+    Invoke-UndoRestore $ctx $legacyRun.RunId $legacyRun.Hash | Out-Null
+    Assert (Test-Path $legacyFile) 'Legacy run remains restorable'
+    $script:expiryChecks = 0
+    function Invoke-ExpiredUndoRuns { param($Context) $script:expiryChecks++ }
+    function Test-InteractiveTerminal { return $true }
+    Invoke-AgentPurge @()
+    Assert ($script:expiryChecks -eq 1) 'Interactive launch checks expired runs once before the menu'
+    Invoke-AgentPurge @('settings', 'show') | Out-Null
+    Assert ($script:expiryChecks -eq 1) 'Read-only settings command does not run expiry cleanup'
+    Write-Output 'PASS: fixtures, keyboard cleanup, retention settings, expiry retry, legacy undo, restore, command dispatch, install/update/uninstall.'
 } finally {
     $full = Get-FullPath $fixture
     $tempRoot = Get-FullPath $env:TEMP
