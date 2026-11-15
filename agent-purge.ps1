@@ -15,6 +15,19 @@ function Test-Within([string]$Path, [string]$Root) {
         $pathFull.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-CurrentProjectPath {
+    try {
+        $cursor = Get-FullPath (Get-Location).ProviderPath
+        while ($true) {
+            if (Test-Path -LiteralPath (Join-Path $cursor '.git')) { return $cursor }
+            $parent = Split-Path -Parent $cursor
+            if (-not $parent -or $parent -eq $cursor) { break }
+            $cursor = $parent
+        }
+    } catch { }
+    return ''
+}
+
 function New-AgentPurgeContext {
     param(
         [string]$CodexRoot = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }),
@@ -44,7 +57,7 @@ function Get-AgentPurgeConfig($Context, [int]$RetentionOverride = 0) {
         [IO.File]::Move($previous, $Context.ConfigPath)
     }
     if (-not (Test-Path -LiteralPath $Context.ConfigPath)) {
-        return [pscustomobject]@{ RetentionDays = $(if ($RetentionOverride) { $RetentionOverride } else { 30 }); UndoDirectory = ''; UndoHistory = @(); Source = 'default' }
+        return [pscustomobject]@{ RetentionDays = $(if ($RetentionOverride) { $RetentionOverride } else { 30 }); UndoDirectory = ''; UndoHistory = @(); ProjectScopes = @{}; Source = 'default' }
     }
     if (-not (Test-NoReparse $Context.ConfigPath)) { throw 'Unsafe Agent Purge config path' }
     $saved = Get-Content -LiteralPath $Context.ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -65,7 +78,16 @@ function Get-AgentPurgeConfig($Context, [int]$RetentionOverride = 0) {
             $history += $path
         }
     }
-    return [pscustomobject]@{ RetentionDays = $(if ($RetentionOverride) { $RetentionOverride } else { [int]$saved.retentionDays }); UndoDirectory = $undoDirectory; UndoHistory = $history; Source = $Context.ConfigPath }
+    $projectScopes = @{}
+    if ($saved.PSObject.Properties['projectScopes']) {
+        if ($saved.projectScopes -isnot [pscustomobject]) { throw 'Invalid projectScopes in Agent Purge config' }
+        foreach ($entry in $saved.projectScopes.PSObject.Properties) {
+            if (-not [IO.Path]::IsPathRooted($entry.Name) -or (Get-FullPath $entry.Name) -cne $entry.Name -or
+                $entry.Value -cnotin @('project', 'global')) { throw 'Invalid project scope preference in Agent Purge config' }
+            $projectScopes[$entry.Name] = [string]$entry.Value
+        }
+    }
+    return [pscustomobject]@{ RetentionDays = $(if ($RetentionOverride) { $RetentionOverride } else { [int]$saved.retentionDays }); UndoDirectory = $undoDirectory; UndoHistory = $history; ProjectScopes = $projectScopes; Source = $Context.ConfigPath }
 }
 
 function Save-AgentPurgeConfig($Context, $Config) {
@@ -79,6 +101,7 @@ function Save-AgentPurgeConfig($Context, $Config) {
     $body = [ordered]@{ retentionDays = [int]$Config.RetentionDays }
     if ($Config.UndoDirectory) { $body['undoDirectory'] = [string]$Config.UndoDirectory }
     if (@($Config.UndoHistory).Count) { $body['undoHistory'] = @($Config.UndoHistory) }
+    if ($Config.ProjectScopes.Count) { $body['projectScopes'] = $Config.ProjectScopes }
     $temporary = Join-Path $parent ('.agent-purge-config-' + [guid]::NewGuid().ToString('N') + '.tmp')
     $backup = $path + '.previous'
     try {
@@ -97,6 +120,16 @@ function Save-AgentPurgeConfig($Context, $Config) {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
     }
     if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction Stop }
+}
+
+function Set-ProjectScopePreference($Context, [string]$ProjectPath, [string]$Choice) {
+    if ($Choice -cnotin @('project', 'global', 'ask')) { throw 'Scope must be project, global, or ask' }
+    $project = Get-FullPath $ProjectPath
+    if (-not (Test-Path -LiteralPath $project -PathType Container)) { throw 'Project folder not found' }
+    $config = Get-AgentPurgeConfig $Context
+    if ($Choice -eq 'ask') { [void]$config.ProjectScopes.Remove($project) }
+    else { $config.ProjectScopes[$project] = $Choice }
+    Save-AgentPurgeConfig $Context $config
 }
 
 function Set-AgentPurgeRetention($Context, [int]$Days) {
@@ -1617,16 +1650,22 @@ function Show-AgentPurgeHelp {
 Agent Purge: inspect and selectively clean local Codex and Claude storage.
 
 Usage:
-  agent-purge                       Open the guided menu
-  agent-purge clean                 Choose projects with Space, then Enter to review
-  agent-purge clean --all           Preselect all eligible storage; review before deletion
+  agent-purge                       Choose current project or global scope, then open the menu
+  agent-purge scan                  Inspect the chosen scope
+  agent-purge clean                 Choose sessions in the chosen scope, then review
+  agent-purge clean --all           Preselect eligible items in the chosen scope; review
   agent-purge clean --all --advanced
-                                    Also select verified old runtimes and caches
+                                    In global scope, also select old runtimes and caches
   agent-purge clean --project <path> Choose session history for a folder and descendants
   agent-purge scan --global         Inspect global provider storage
   agent-purge scan --global --advanced
                                     Also allow verified old runtimes and caches
   agent-purge scan --project <path> Inspect sessions in a project and descendants
+  agent-purge scope show            Show this Git project's saved scope choice
+  agent-purge scope project         Remember project scope for this Git project
+  agent-purge scope global          Remember global scope for this Git project
+  agent-purge scope ask             Ask again on the next interactive run
+  agent-purge scope reset           Alias for scope ask
   agent-purge restore <run-id> <hash>
                                     Restore files saved in an Agent Purge undo run
   agent-purge settings              View or change retention with keyboard controls
@@ -1640,6 +1679,12 @@ Usage:
   agent-purge update                Install the latest published main script
   agent-purge uninstall             Remove installed files and that PATH entry
   agent-purge --help                Show this help
+
+Inside a Git project, Current project is recommended. Space in the scope
+prompt remembers the selected choice for that project. Explicit scan --global
+and scan/clean --project paths override it. Outside a Git project, scope is global.
+Project scope filters scans and cleanup to recorded sessions in that project;
+settings, restore, and undo-folder cleanup remain global operations.
 
 Project picker: Up/Down move, PgUp/PgDn jump, Home/End ends, F find,
 Space toggle, A select/clear all, Enter review, I inspect.
@@ -1704,16 +1749,63 @@ function Show-SettingsMenu($Context) {
     }
 }
 
-function Show-StartMenu {
-    $labels = @('Choose projects to clean (recommended)', 'Inspect all agent storage', 'Clean all eligible storage', 'Choose one project folder', 'Settings', 'Exit')
-    $descriptions = @(
-        'See project sizes, toggle projects with Space, then review cleanup with Enter.',
-        'Browse providers and categories to understand storage and protected items.',
-        'Preselect eligible sessions and logs. You can deselect before confirming cleanup.',
-        'Limit session history to a project folder and its descendants.',
-        'Set undo retention and storage location, or clean saved undo data.',
-        'Close Agent Purge without making further changes.'
-    )
+function Show-ProjectScopePrompt($Context, [string]$ProjectPath) {
+    $index = 0
+    $remember = $false
+    while ($true) {
+        Clear-Host
+        Write-ScreenLine 'AGENT PURGE / CHOOSE SCOPE' Cyan
+        Write-ScreenLine 'Where should Agent Purge look for agent history?'
+        Write-ScreenLine ('Project: ' + (Format-ProjectLabel $ProjectPath ((Get-TerminalSize).Width - 10))) Cyan
+        Write-ScreenLine ('{0} Current project (recommended)' -f $(if ($index -eq 0) { '>' } else { ' ' }))
+        Write-ScreenLine ('{0} Global agent storage' -f $(if ($index -eq 1) { '>' } else { ' ' }))
+        Write-ScreenLine ('{0} Do not ask again for this project' -f $(if ($remember) { '[x]' } else { '[ ]' }))
+        Write-ScreenLine 'Up/Down choose | Space toggle memory | Enter continue | Esc quit'
+        $key = Read-MenuKey
+        switch ($key) {
+            'Escape' { return 'Exit' }
+            'UpArrow' { $index = ($index + 1) % 2 }
+            'DownArrow' { $index = ($index + 1) % 2 }
+            'Spacebar' { $remember = -not $remember }
+            'Enter' {
+                $choice = if ($index -eq 0) { 'project' } else { 'global' }
+                if ($remember) { Set-ProjectScopePreference $Context $ProjectPath $choice }
+                return $choice
+            }
+        }
+    }
+}
+
+function Resolve-ProjectScope($Context, [string]$ProjectPath) {
+    if (-not $ProjectPath) { return 'global' }
+    $config = Get-AgentPurgeConfig $Context
+    if ($config.ProjectScopes.ContainsKey($ProjectPath)) { return $config.ProjectScopes[$ProjectPath] }
+    if (-not (Test-InteractiveTerminal)) { return 'project' }
+    return Show-ProjectScopePrompt $Context $ProjectPath
+}
+
+function Show-StartMenu([string]$Scope = 'global', [string]$ProjectPath = '') {
+    if ($Scope -eq 'project') {
+        $labels = @('Clean current project (recommended)', 'Inspect current project', 'Clean all eligible current-project sessions', 'Switch to global scope', 'Settings', 'Exit')
+        $descriptions = @(
+            'Review agent sessions recorded in this project and its descendants.',
+            "Browse this project's Codex and Claude sessions.",
+            'Preselect eligible sessions from this project; review before cleanup.',
+            'Use all known agent storage for this run.',
+            'Set undo retention and storage location, or clean saved undo data.',
+            'Close Agent Purge without making further changes.'
+        )
+    } else {
+        $labels = @('Choose projects to clean (recommended)', 'Inspect all agent storage', 'Clean all eligible storage', $(if ($ProjectPath) { 'Switch to current project' } else { 'Choose one project folder' }), 'Settings', 'Exit')
+        $descriptions = @(
+            'See project sizes, toggle projects with Space, then review cleanup with Enter.',
+            'Browse providers and categories to understand storage and protected items.',
+            'Preselect eligible sessions and logs. You can deselect before confirming cleanup.',
+            $(if ($ProjectPath) { 'Use only sessions recorded in the current project.' } else { 'Limit session history to a project folder and its descendants.' }),
+            'Set undo retention and storage location, or clean saved undo data.',
+            'Close Agent Purge without making further changes.'
+        )
+    }
     $index = 0
     while ($true) {
         Clear-Host
@@ -1740,9 +1832,13 @@ function Show-StartMenu {
         if ($key -ne 'Enter') { continue }
         switch ($index) {
             0 { return @('clean') }
-            1 { return @('scan', '--global') }
+            1 { if ($Scope -eq 'project') { return @('scan') }; return @('scan', '--global') }
             2 { return @('clean', '--all') }
             3 {
+                if ($ProjectPath) {
+                    if ($Scope -eq 'project') { return @('__scope', 'global') }
+                    return @('__scope', 'project')
+                }
                 Write-Host 'Enter a source-project folder to find its recorded agent history. Leave blank to go back.'
                 $path = (Read-Host 'Project folder').Trim().Trim('"')
                 if (-not $path) { continue }
@@ -1762,15 +1858,24 @@ function Invoke-AgentPurge([string[]]$Arguments) {
     if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core' -and $env:OS -ne 'Windows_NT') { throw 'Agent Purge requires Windows.' }
     $fromMenu = -not $Arguments.Count
     $expiryChecked = $false
+    $detectedProject = Get-CurrentProjectPath
+    $scope = ''
+    $scopeChosen = $false
     if ($fromMenu -and -not (Test-InteractiveTerminal)) { Show-AgentPurgeHelp; return }
     do {
         if ($fromMenu) {
-            if (-not $expiryChecked) {
+            if (-not $scopeChosen) {
+                $scope = Resolve-ProjectScope (New-AgentPurgeContext) $detectedProject
+                if ($scope -eq 'Exit') { return }
+                $scopeChosen = $true
+            }
+            if (-not $expiryChecked -and $scope -eq 'global') {
                 if ((Show-ExpiryCheck (New-AgentPurgeContext)) -eq 'Exit') { return }
                 $expiryChecked = $true
             }
-            $Arguments = @(Show-StartMenu)
+            $Arguments = @(Show-StartMenu $scope $detectedProject)
             if (-not $Arguments.Count) { return }
+            if ($Arguments[0] -eq '__scope') { $scope = $Arguments[1]; continue }
         }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq '--help') { Show-AgentPurgeHelp; return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
@@ -1779,6 +1884,24 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'undo' -and $Arguments[1] -eq 'clean') {
             Invoke-UndoFolderCleanup (New-AgentPurgeContext)
             return
+        }
+        if ($Arguments[0] -eq 'scope') {
+            if (-not $detectedProject) { throw 'Run scope commands inside a Git project' }
+            $context = New-AgentPurgeContext
+            if ($Arguments.Count -eq 1 -or ($Arguments.Count -eq 2 -and $Arguments[1] -eq 'show')) {
+                $saved = Get-AgentPurgeConfig $context
+                $preference = if ($saved.ProjectScopes.ContainsKey($detectedProject)) { $saved.ProjectScopes[$detectedProject] } else { 'ask' }
+                Write-Output "Project: $detectedProject"
+                Write-Output "Scope preference: $preference"
+                return
+            }
+            if ($Arguments.Count -eq 2 -and $Arguments[1] -in @('project', 'global', 'ask', 'reset')) {
+                $choice = if ($Arguments[1] -eq 'reset') { 'ask' } else { $Arguments[1] }
+                Set-ProjectScopePreference $context $detectedProject $choice
+                Write-Output "Scope preference for $detectedProject`: $choice"
+                return
+            }
+            throw 'Invalid scope command. Use scope show, project, global, ask, or reset.'
         }
         if ($Arguments[0] -eq 'settings') {
             $settingsContext = New-AgentPurgeContext
@@ -1818,7 +1941,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($Arguments[0] -notin @('scan', 'clean')) { throw 'Unknown command. Use --help.' }
         $clean = $Arguments[0] -eq 'clean'
         $advanced = $false; $selectAll = $false; $project = ''
-        if ($Arguments.Count -eq 1 -and $clean) { }
+        if ($Arguments.Count -eq 1) { }
         elseif ($Arguments.Count -in @(2, 3) -and (($clean -and $Arguments[1] -eq '--all') -or (-not $clean -and $Arguments[1] -eq '--global')) -and ($Arguments.Count -eq 2 -or $Arguments[2] -eq '--advanced')) {
             $selectAll = $clean
             $advanced = $Arguments.Count -eq 3
@@ -1827,13 +1950,22 @@ function Invoke-AgentPurge([string[]]$Arguments) {
             $project = (Get-Item -LiteralPath $Arguments[2]).FullName
         } else { throw 'Invalid arguments. Use --help.' }
         $context = New-AgentPurgeContext
+        $explicitScope = ($Arguments.Count -eq 3 -and $Arguments[1] -eq '--project') -or ($Arguments.Count -ge 2 -and $Arguments[1] -eq '--global')
+        if (-not $explicitScope) {
+            if (-not $scopeChosen) {
+                $scope = Resolve-ProjectScope $context $detectedProject
+                if ($scope -eq 'Exit') { return }
+                $scopeChosen = $true
+            }
+            if ($scope -eq 'project') { $project = $detectedProject }
+        }
         $items = @(Get-ScanInventory $context $advanced $project)
         if (-not (Test-InteractiveTerminal)) {
             Write-Output 'Read-only inventory: interactive selection and confirmation are required for cleanup.'
             Write-InventoryText $items
             return
         }
-        if (-not $expiryChecked) {
+        if (-not $expiryChecked -and -not $project) {
             if ((Show-ExpiryCheck $context) -eq 'Exit') { return }
             $expiryChecked = $true
         }

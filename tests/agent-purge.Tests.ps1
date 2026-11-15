@@ -32,6 +32,10 @@ try {
     $child = Join-Path $project 'nested'
     $other = Join-Path $fixture 'work-other'
     New-Item -ItemType Directory -Path $child, $other -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $project '.git') | Out-Null
+    Push-Location $child
+    try { Assert ((Get-CurrentProjectPath) -eq $project) 'Nested working directory resolves to its Git project' }
+    finally { Pop-Location }
     $cid = '11111111-1111-4111-8111-111111111111'
     $codexFile = Join-Path $codexRoot "sessions\2026\11\14\rollout-2026-11-14T12-00-00-$cid.jsonl"
     Write-JsonLine $codexFile @{type='session_meta';payload=@{id=$cid;cwd=$child;timestamp='2026-11-14T12:00:00Z'}}
@@ -378,6 +382,13 @@ c.close()
     function Clear-Host { }
     function Write-Host { param([object]$Object, $ForegroundColor) $script:screen.Add([string]$Object) }
     function Test-InteractiveTerminal { return $true }
+    $script:keys.Enqueue('Enter')
+    Assert ((Show-ProjectScopePrompt $ctx $project) -eq 'project' -and -not (Get-AgentPurgeConfig $ctx).ProjectScopes.ContainsKey($project)) 'Current project is the unsaved recommended scope'
+    foreach ($key in @('DownArrow', 'Spacebar', 'Enter')) { $script:keys.Enqueue($key) }
+    Assert ((Show-ProjectScopePrompt $ctx $project) -eq 'global' -and (Resolve-ProjectScope $ctx $project) -eq 'global' -and $script:keys.Count -eq 0) 'Remembered global scope skips later prompts'
+    Set-ProjectScopePreference $ctx $project 'ask'
+    $script:keys.Enqueue('Enter')
+    Assert ((Resolve-ProjectScope $ctx $project) -eq 'project' -and -not (Get-AgentPurgeConfig $ctx).ProjectScopes.ContainsKey($project)) 'Ask resets the saved project choice'
     $ui = [pscustomobject]@{Items=$all;Selected=@{};Context=$ctx;Advanced=$false;ProjectPath=''}
     foreach ($key in @('Spacebar', 'I', 'Enter', 'Enter', 'Enter', 'B', 'B', 'B', 'B', 'Enter', 'B', 'B')) { $script:keys.Enqueue($key) }
     # The largest fixture project has a Codex session; leave its review and return.
@@ -412,6 +423,10 @@ c.close()
     Assert ($script:screen -match 'Nothing selected') 'Enter with no selection explains how to proceed'
     foreach ($key in @('DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
     Assert (((Show-StartMenu) -join ' ') -eq 'scan --global') 'Home menu arrow navigation chooses inspection'
+    foreach ($key in @('DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    Assert (((Show-StartMenu 'project' $project) -join ' ') -eq 'scan') 'Project menu inspection inherits the current project scope'
+    foreach ($key in @('DownArrow', 'DownArrow', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    Assert (((Show-StartMenu 'project' $project) -join ' ') -eq '__scope global') 'Project menu can switch to global scope for this run'
     foreach ($key in @('DownArrow', 'DownArrow', 'DownArrow', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
     Assert (((Show-StartMenu) -join ' ') -eq 'settings') 'Home menu opens settings with arrow keys'
     foreach ($key in @('UpArrow', 'Spacebar')) { $script:keys.Enqueue($key) }
@@ -447,6 +462,8 @@ c.close()
     Assert ($script:screen[-1] -notmatch '[\x00-\x1f]') 'Menu metadata cannot inject terminal control characters'
 
     # Command dispatch uses fixture inventory, never the live provider directories.
+    $script:detectedProject = ''
+    function Get-CurrentProjectPath { return $script:detectedProject }
     $script:scanRequests = @()
     $script:capturedSession = $null
     $script:scanItems = @($all) + @($sameProject)
@@ -476,7 +493,7 @@ c.close()
     Invoke-AgentPurge @('update')
     Assert ($script:explicitUpdateRequests -eq 1) 'Update command dispatches without scanning or a terminal'
     $requestCount = $script:scanRequests.Count
-    foreach ($invalid in @(@('clean', '--all', '--yes'), @('clean', '--project'), @('clean', '--all', '--project', $project), @('scan'), @('scan', '--global', '--wrong'))) {
+    foreach ($invalid in @(@('clean', '--all', '--yes'), @('clean', '--project'), @('clean', '--all', '--project', $project), @('scan', '--global', '--wrong'))) {
         $rejected = $false
         try { Invoke-AgentPurge $invalid } catch { $rejected = $true }
         Assert $rejected ('Reject unsupported or conflicting arguments: ' + ($invalid -join ' '))
@@ -492,7 +509,30 @@ c.close()
     Assert ($invalidSettingCommand -and (Get-AgentPurgeConfig $ctx).RetentionDays -eq 14) 'Settings command rejects nonnumeric retention without changing the file'
     Invoke-AgentPurge @()
     Assert ($script:homeMenuCount -eq 6 -and $script:updateRequests -eq $requests) 'Opening the home menu does not contact GitHub'
+    $script:detectedProject = $project
+    Set-ProjectScopePreference $ctx $project 'project'
+    Set-ProjectScopePreference $ctx $other 'global'
+    Invoke-AgentPurge @('scan')
+    Assert ($script:scanRequests[-1].ProjectPath -eq $project -and $script:capturedSession.ProjectPath -eq $project) 'Bare scan uses the remembered current-project scope'
+    Invoke-AgentPurge @('clean', '--all')
+    Assert ($script:scanRequests[-1].ProjectPath -eq $project -and $script:capturedSession.ProjectPath -eq $project) 'Clean-all stays within the remembered project scope'
+    Invoke-AgentPurge @('scan', '--global')
+    Assert (-not $script:scanRequests[-1].ProjectPath) 'Explicit global scan overrides the project preference'
+    Invoke-AgentPurge @('clean', '--project', $other)
+    Assert ($script:scanRequests[-1].ProjectPath -eq $other) 'Explicit project path overrides the detected project'
+    Assert (((Invoke-AgentPurge @('scope', 'show')) -join ' ') -match 'Scope preference: project') 'Scope show reports the saved project choice'
+    Invoke-AgentPurge @('scope', 'global') | Out-Null
+    Invoke-AgentPurge @('clean')
+    Assert (-not $script:scanRequests[-1].ProjectPath) 'Remembered global choice applies to bare clean'
+    Invoke-AgentPurge @('scope', 'reset') | Out-Null
+    Assert (-not (Get-AgentPurgeConfig $ctx).ProjectScopes.ContainsKey($project) -and (Get-AgentPurgeConfig $ctx).ProjectScopes[$other] -eq 'global') 'Scope reset asks again only for the current project'
+    Invoke-AgentPurge @('scope', 'project') | Out-Null
+    Invoke-AgentPurge @('scope', 'ask') | Out-Null
+    Assert (-not (Get-AgentPurgeConfig $ctx).ProjectScopes.ContainsKey($project)) 'Scope ask also clears the remembered choice'
     function Test-InteractiveTerminal { return $false }
+    Invoke-AgentPurge @('scan') | Out-Null
+    Assert ($script:scanRequests[-1].ProjectPath -eq $project) 'Redirected bare scan defaults to the current project without prompting'
+    $script:detectedProject = ''
     $script:capturedSession = $null
     $readOnly = (Invoke-AgentPurge @('clean', '--all')) -join "`n"
     Assert ($null -eq $script:capturedSession -and $readOnly -match 'Read-only inventory' -and $readOnly -match 'By project' -and $readOnly -match 'incomplete') 'Redirected clean-all only prints inventory including incomplete-size context'

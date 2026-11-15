@@ -67,14 +67,19 @@ Uninstall preserves other files in the install directory and refuses to remove a
 
 | Command | Action |
 | --- | --- |
-| `agent-purge` | Open the guided menu with explanations for each choice. |
-| `agent-purge clean` | Choose projects in a size-sorted checklist, then review cleanup. |
-| `agent-purge clean --all` | Preselect all eligible sessions and logs; review and confirm before removal. |
-| `agent-purge clean --all --advanced` | Also preselect verified old runtimes and known cache entries. |
+| `agent-purge` | Choose current project or global scope, then open the guided menu. |
+| `agent-purge scan` | Inspect the selected scope. |
+| `agent-purge clean` | Choose eligible items in the selected scope, then review cleanup. |
+| `agent-purge clean --all` | Preselect eligible items in the selected scope; review before removal. |
+| `agent-purge clean --all --advanced` | In global scope, also preselect verified old runtimes and known cache entries. |
 | `agent-purge clean --project <path>` | Choose session history for a folder and its descendants. |
 | `agent-purge scan --global` | Inspect known global Codex and Claude storage. |
 | `agent-purge scan --global --advanced` | Also make verified old runtimes and provider cache entries selectable. |
 | `agent-purge scan --project <path>` | Inspect sessions whose recorded working directory is the path or a descendant. |
+| `agent-purge scope show` | Show this Git project's saved scope preference. |
+| `agent-purge scope project` | Remember current project as the scope for this Git project. |
+| `agent-purge scope global` | Remember global as the scope for this Git project. |
+| `agent-purge scope ask` or `agent-purge scope reset` | Clear this project's preference so the next interactive run asks again. |
 | `agent-purge install` | Install the user-local launcher and PATH entry. |
 | `agent-purge update` | Update the installed command from published `main`. |
 | `agent-purge uninstall` | Remove the installed files and PATH entry. |
@@ -88,6 +93,14 @@ Uninstall preserves other files in the install directory and refuses to remove a
 
 Both `scan` and `clean` require an interactive terminal to select or remove items. Redirected input always prints a **read-only** inventory, even with `clean --all`; there is no unattended deletion option. The global scan may take time because it measures logical file sizes. Inaccessible entries are marked **incomplete**, and affected totals are lower bounds.
 
+## Current project scope
+
+For the guided menu or a bare `scan` or `clean` inside a Git project or one of its subfolders, Agent Purge asks whether to use **Current project (recommended)** or **Global agent storage**. Press Up/Down to choose and Enter to continue. Press Space on **Do not ask again for this project** before Enter to save that choice for later runs in the same project. Without a saved choice, each interactive run asks again. A redirected, noninteractive `scan` or `clean` defaults to the current project without a prompt. Outside a Git project, the scope is global.
+
+Current project scope matches Codex and Claude sessions whose recorded working directory is the Git project folder or a descendant. It excludes sessions from other projects, shared logs, caches, and runtimes. The scope applies to `scan`, `clean`, `clean --all`, and their menu actions. Explicit `scan --global`, `scan --project <path>`, or `clean --project <path>` overrides the saved choice for that command. Switching scope in the menu changes only the current run; `scope project` and `scope global` save the choice for that Git project. `scope show`, `scope ask`, and `scope reset` work from anywhere inside the project. Scope preferences are stored in `%LOCALAPPDATA%\agent-purge\config.json` and remain after uninstall.
+
+Settings, restore, and undo-folder cleanup operate on the user-wide Agent Purge data regardless of the selected scan scope. Use `agent-purge settings show` to see the undo folder; cleaning that folder affects saved undo runs from all projects.
+
 ## Settings
 
 Choose **Settings** from the main menu, or run `agent-purge settings`. Use arrows to change the undo retention by one day, PgUp/PgDn by ten days, Home to return to 30 days, and Enter/Space to save. Press **U** to enter an absolute undo folder path, or **C** to clean the current undo folder. B/Backspace leaves without saving. The default retention is 30 days; the allowed range is 1–365. `settings show` prints both saved values.
@@ -100,7 +113,7 @@ Settings are stored in `%LOCALAPPDATA%\agent-purge\config.json`. Each new undo r
 
 ## Choose projects and clean
 
-Run `agent-purge clean`, or choose **Choose projects to clean** from the main menu:
+In global scope, run `agent-purge clean` or choose **Choose projects to clean** from the main menu:
 
 1. Read the question and storage summary above the checklist. Projects are sorted largest first.
 2. Move with **Up/Down**. The focused project shows item count, eligible size, and size distributions by provider and category, including percentages.
@@ -114,7 +127,7 @@ For a head start with everything eligible selected, run:
 agent-purge clean --all
 ```
 
-This opens the same checklist, with eligible items selected. Deselect any projects you want to keep, then press **Enter**. “All” covers recognized eligible agent storage in the scan; it does not include protected files, source-project folders, or unrecognized storage. Caches and verified old runtimes require `--advanced`.
+This opens the same checklist, with eligible items selected. Deselect any projects you want to keep, then press **Enter**. “All” covers recognized eligible agent storage in the current scope; it does not include protected files, source-project folders, or unrecognized storage. In global scope, caches and verified old runtimes require `--advanced`.
 
 Project rows use exact recorded working directories. A nested directory can have its own row; `--project <path>` limits the inventory to that directory and descendants. Shared logs, caches, runtimes, and other provider storage have a separate group because they cannot reliably be assigned to a project. Sessions with unavailable project metadata are inspection only.
 
