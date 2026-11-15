@@ -461,10 +461,10 @@ c.close()
         [IO.Directory]::Move($Path, $target)
         $script:recycled.Add($target)
     }
-    Invoke-ExpiredUndoRuns $ctx
-    $named = Join-Path (Join-Path $undoRoot 'payload') ('agent-purge-' + $expiryRun.RunId + '-' + $expiryRun.Hash.Substring(0, 12))
+    [void](Invoke-ExpiredUndoRuns $ctx)
+    $named = Join-Path (Join-Path $undoRoot 'expired') ('agent-purge-' + $expiryRun.RunId + '-' + $expiryRun.Hash.Substring(0, 12))
     Assert ((Test-Path $named) -and $script:recycled.Count -eq 0) 'Failed Recycle Bin move retains the named undo folder for retry'
-    Invoke-ExpiredUndoRuns $ctx
+    [void](Invoke-ExpiredUndoRuns $ctx)
     Assert ($script:recycled.Count -eq 1 -and -not (Test-Path $named) -and (Test-Path (Join-Path $script:recycled[0] 'agent-purge-manifest.json'))) 'Expiry retries and recycles one folder with its manifest'
     $expiredRestoreRejected = $false
     try { Invoke-UndoRestore $ctx $expiryRun.RunId $expiryRun.Hash | Out-Null } catch { $expiredRestoreRejected = $true }
@@ -478,10 +478,30 @@ c.close()
     $legacyRun.Hash = Get-UndoHash $legacyRun
     $legacyManifest = Join-Path (Join-Path $undoRoot 'runs') ($legacyRun.RunId + '.json')
     [IO.File]::WriteAllText($legacyManifest, ($legacyRun | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
-    Invoke-ExpiredUndoRuns $ctx ([datetimeoffset]::UtcNow.AddYears(2))
+    [void](Invoke-ExpiredUndoRuns $ctx ([datetimeoffset]::UtcNow.AddYears(2)))
     Assert ($script:recycled.Count -eq 1 -and (Test-Path $legacyRun.Entries[0].Archived)) 'Legacy runs without a deadline are not expired'
     Invoke-UndoRestore $ctx $legacyRun.RunId $legacyRun.Hash | Out-Null
     Assert (Test-Path $legacyFile) 'Legacy run remains restorable'
+    $multiCtx = $ctx.PSObject.Copy()
+    $multiCtx.ClaudeVersions = Join-Path $fixture 'version-area\versions'
+    New-Item -ItemType Directory -Path $multiCtx.ClaudeVersions -Force | Out-Null
+    $multiLog = Join-Path $claudeRoot 'debug\multi.txt'
+    $multiRuntime = Join-Path $multiCtx.ClaudeVersions '1.9.0'
+    Set-Content -LiteralPath $multiLog -Value 'log'
+    Set-Content -LiteralPath $multiRuntime -Value 'runtime'
+    $multiItems = @(
+        (New-InventoryItem $multiCtx 'Claude' 'Logs' 'Log' $multiLog '' '' '' '' '' '' $true),
+        (New-InventoryItem $multiCtx 'Claude' 'Runtimes' 'ClaudeRuntime' $multiRuntime '' '' '' '' '' '' $true)
+    )
+    $multiRun = New-UndoRun $multiItems $multiCtx
+    foreach ($entry in $multiRun.Entries) { Invoke-UndoMove $entry.Original $entry.Archived }
+    $multiRun.ExpiresAtUtc = [datetimeoffset]::UtcNow.AddMinutes(-1).ToString('o')
+    $multiRun.Hash = Get-UndoHash $multiRun
+    $multiManifest = Join-Path (Join-Path $undoRoot 'runs') ($multiRun.RunId + '.json')
+    [IO.File]::WriteAllText($multiManifest, ($multiRun | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
+    [void](Invoke-ExpiredUndoRuns $multiCtx)
+    $bundleFiles = @(Get-ChildItem -LiteralPath $script:recycled[-1] -Recurse -File | Where-Object { $_.Name -in @('0', '1') })
+    Assert ($script:recycled.Count -eq 2 -and $bundleFiles.Count -eq 2) 'One Recycle Bin folder combines same-volume payloads from two undo locations'
     $script:expiryChecks = 0
     function Invoke-ExpiredUndoRuns { param($Context) $script:expiryChecks++ }
     function Test-InteractiveTerminal { return $true }
@@ -489,7 +509,10 @@ c.close()
     Assert ($script:expiryChecks -eq 1) 'Interactive launch checks expired runs once before the menu'
     Invoke-AgentPurge @('settings', 'show') | Out-Null
     Assert ($script:expiryChecks -eq 1) 'Read-only settings command does not run expiry cleanup'
-    Write-Output 'PASS: fixtures, keyboard cleanup, retention settings, expiry retry, legacy undo, restore, command dispatch, install/update/uninstall.'
+    function Invoke-ExpiredUndoRuns { param($Context) return [pscustomobject]@{ Moved = 1; Skipped = 0 } }
+    $script:keys.Enqueue('Enter')
+    Assert ((Show-ExpiryCheck $ctx) -eq 'Continue' -and $script:keys.Count -eq 0 -and $script:screen -match 'Undo expiry: 1 folder') 'Expiry result stays visible until acknowledged before the menu redraws'
+    Write-Output 'PASS: fixtures, keyboard cleanup, retention settings, per-volume expiry and retry, legacy undo, restore, command dispatch, install/update/uninstall.'
 } finally {
     $full = Get-FullPath $fixture
     $tempRoot = Get-FullPath $env:TEMP

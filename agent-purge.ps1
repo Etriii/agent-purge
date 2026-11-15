@@ -656,7 +656,8 @@ function Get-UndoExpiry($Run) {
 
 function Invoke-ExpiredUndoRun($Context, $Run, [string]$ManifestPath, [datetimeoffset]$Now = [datetimeoffset]::UtcNow) {
     $expires = Get-UndoExpiry $Run
-    if ($null -eq $expires -or $expires -gt $Now) { return }
+    if ($null -eq $expires -or $expires -gt $Now) { return [pscustomobject]@{ Moved = 0; Skipped = 0 } }
+    $moved = 0; $skipped = 0
     $name = 'agent-purge-' + $Run.RunId + '-' + $Run.Hash.Substring(0, 12)
     $roots = @{}
     foreach ($entry in $Run.Entries) {
@@ -665,53 +666,102 @@ function Invoke-ExpiredUndoRun($Context, $Run, [string]$ManifestPath, [datetimeo
         if ($entry.Archived -cne $expected) { throw 'Undo manifest path mismatch' }
         $roots[$root] = $true
     }
+    $byVolume = @{}
     foreach ($root in $roots.Keys) {
+        $volume = [IO.Path]::GetPathRoot($root)
+        if (-not $byVolume.ContainsKey($volume)) { $byVolume[$volume] = New-Object 'System.Collections.Generic.List[string]' }
+        $byVolume[$volume].Add($root)
+    }
+    foreach ($volume in $byVolume.Keys) {
+        $volumeRoots = @($byVolume[$volume] | Sort-Object)
+        $anchor = $volumeRoots[0]
+        $bundle = Join-Path (Join-Path $anchor 'expired') $name
         try {
-            if (-not (Test-Path -LiteralPath $root)) { throw 'Undo location is missing' }
-            Initialize-UndoRoot $root
-            $payload = Join-Path $root 'payload'
-            $source = Join-Path $payload $Run.RunId
-            $named = Join-Path $payload $name
-            $sourceExists = Test-Path -LiteralPath $source -PathType Container
-            $namedExists = Test-Path -LiteralPath $named -PathType Container
-            if ($sourceExists -and $namedExists) { throw 'Both original and named undo folders exist' }
-            if (-not $sourceExists -and -not $namedExists) { continue }
-            if ($sourceExists) {
-                if (-not (Test-NoReparse $source $true)) { throw 'Unsafe undo folder contents' }
-                $children = @(Get-ChildItem -LiteralPath $source -Force -ErrorAction Stop)
+            if (-not (Test-Path -LiteralPath $anchor)) { throw 'Undo location is missing' }
+            Initialize-UndoRoot $anchor
+            $hasPayload = Test-Path -LiteralPath $bundle -PathType Container
+            foreach ($root in $volumeRoots) {
+                $source = Join-Path (Join-Path $root 'payload') $Run.RunId
+                $oldNamed = Join-Path (Join-Path $root 'payload') $name
+                if ((Test-Path -LiteralPath $oldNamed -PathType Container) -or
+                    ((Test-Path -LiteralPath $source -PathType Container) -and @(Get-ChildItem -LiteralPath $source -Force -ErrorAction Stop).Count)) { $hasPayload = $true }
+            }
+            if (-not $hasPayload) { continue }
+            $expired = Split-Path -Parent $bundle
+            if ((Test-Path -LiteralPath $expired) -and -not (Test-NoReparse $expired)) { throw 'Unsafe expired-run folder' }
+            if ((Test-Path -LiteralPath $bundle) -and -not (Test-NoReparse $bundle)) { throw 'Unsafe expired-run bundle' }
+            New-Item -ItemType Directory -Path $bundle -Force -ErrorAction Stop | Out-Null
+            if (-not (Test-NoReparse $bundle)) { throw 'Unsafe expired-run bundle' }
+            $copy = Join-Path $bundle 'agent-purge-manifest.json'
+            if (Test-Path -LiteralPath $copy) {
+                if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256).Hash) { throw 'Expired-run manifest differs from the run manifest' }
+            } else { [IO.File]::Copy($ManifestPath, $copy) }
+            for ($i = 0; $i -lt $volumeRoots.Count; $i++) {
+                $root = $volumeRoots[$i]
+                if (-not (Test-Path -LiteralPath $root)) { throw "Undo location is missing: $root" }
+                Initialize-UndoRoot $root
+                $source = Join-Path (Join-Path $root 'payload') $Run.RunId
+                $oldNamed = Join-Path (Join-Path $root 'payload') $name
+                $part = Join-Path $bundle ("part-$i")
+                $sourceExists = Test-Path -LiteralPath $source -PathType Container
+                $oldExists = Test-Path -LiteralPath $oldNamed -PathType Container
+                if (([int]$sourceExists + [int]$oldExists + [int](Test-Path -LiteralPath $part -PathType Container)) -gt 1) { throw "Conflicting undo folders at $root" }
+                if (Test-Path -LiteralPath $part -PathType Container) { continue }
+                $from = if ($oldExists) { $oldNamed } else { $source }
+                if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
+                if (-not (Test-NoReparse $from $true)) { throw "Unsafe undo folder contents at $root" }
+                $children = @(Get-ChildItem -LiteralPath $from -Force -ErrorAction Stop)
                 if (-not $children.Count) { continue }
                 $expectedNames = @($Run.Entries | Where-Object { (Split-Path -Parent $_.Archived) -eq $source } | ForEach-Object { Split-Path -Leaf $_.Archived })
                 foreach ($child in $children) {
                     if ($child.Name -notin $expectedNames -and $child.Name -ne 'agent-purge-manifest.json') { throw "Unexpected undo folder entry: $($child.Name)" }
                 }
-                $copy = Join-Path $source 'agent-purge-manifest.json'
-                if (Test-Path -LiteralPath $copy) {
-                    if ((Get-FileHash -LiteralPath $copy -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $ManifestPath -Algorithm SHA256).Hash) { throw 'Undo folder manifest differs from the run manifest' }
-                } else { [IO.File]::Copy($ManifestPath, $copy) }
-                [IO.Directory]::Move($source, $named)
+                [IO.Directory]::Move($from, $part)
             }
-            if (-not (Test-NoReparse $named $true)) { throw 'Unsafe named undo folder contents' }
-            Invoke-FileRemoval $named 'Recycle Bin'
-            Write-Host "Expired undo run $($Run.RunId): moved $name to the Recycle Bin."
-        } catch { Write-Host "Expiry skipped for $($Run.RunId) at $root`: $($_.Exception.Message)" -ForegroundColor Yellow }
+            $parts = @(Get-ChildItem -LiteralPath $bundle -Directory -Filter 'part-*' -ErrorAction Stop)
+            if (-not $parts.Count) { continue }
+            $allowed = @('agent-purge-manifest.json') + @(0..($volumeRoots.Count - 1) | ForEach-Object { "part-$_" })
+            foreach ($child in (Get-ChildItem -LiteralPath $bundle -Force -ErrorAction Stop)) {
+                if ($child.Name -notin $allowed) { throw "Unexpected expired-run bundle entry: $($child.Name)" }
+            }
+            if (-not (Test-NoReparse $bundle $true)) { throw 'Unsafe expired-run bundle contents' }
+            Invoke-FileRemoval $bundle 'Recycle Bin'
+            $moved++
+            Write-Host "Expired undo run $($Run.RunId): moved $name to the Recycle Bin from $volume."
+        } catch { $skipped++; Write-Host "Expiry skipped for $($Run.RunId) on $volume`: $($_.Exception.Message)" -ForegroundColor Yellow }
     }
+    return [pscustomobject]@{ Moved = $moved; Skipped = $skipped }
 }
 
 function Invoke-ExpiredUndoRuns($Context, [datetimeoffset]$Now = [datetimeoffset]::UtcNow) {
+    $moved = 0; $skipped = 0
     $root = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
-    if (-not (Test-Path -LiteralPath $root)) { return }
+    if (-not (Test-Path -LiteralPath $root)) { return [pscustomobject]@{ Moved = 0; Skipped = 0 } }
     Initialize-UndoRoot $root
     $runs = Join-Path $root 'runs'
-    if (-not (Test-Path -LiteralPath $runs)) { return }
+    if (-not (Test-Path -LiteralPath $runs)) { return [pscustomobject]@{ Moved = 0; Skipped = 0 } }
     if (-not (Test-NoReparse $runs)) { throw 'Unsafe undo manifest directory' }
     foreach ($file in (Get-ChildItem -LiteralPath $runs -File -Filter '*.json' -ErrorAction Stop)) {
         try {
             if (-not (Test-NoReparse $file.FullName)) { throw 'Unsafe undo manifest' }
             $run = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             if ($run.RunId -cne $file.BaseName -or $run.Hash -cne (Get-UndoHash $run)) { throw 'Undo manifest hash mismatch' }
-            Invoke-ExpiredUndoRun $Context $run $file.FullName $Now
-        } catch { Write-Host "Expiry skipped for $($file.Name): $($_.Exception.Message)" -ForegroundColor Yellow }
+            $result = Invoke-ExpiredUndoRun $Context $run $file.FullName $Now
+            $moved += $result.Moved; $skipped += $result.Skipped
+        } catch { $skipped++; Write-Host "Expiry skipped for $($file.Name): $($_.Exception.Message)" -ForegroundColor Yellow }
     }
+    return [pscustomobject]@{ Moved = $moved; Skipped = $skipped }
+}
+
+function Show-ExpiryCheck($Context) {
+    try { $result = Invoke-ExpiredUndoRuns $Context }
+    catch { Write-Host "Undo expiry check failed: $($_.Exception.Message)" -ForegroundColor Yellow; $result = [pscustomobject]@{ Moved = 0; Skipped = 1 } }
+    if ($result.Moved -or $result.Skipped) {
+        Write-Host "Undo expiry: $($result.Moved) folder(s) moved to Recycle Bin; $($result.Skipped) skipped."
+        Write-Host 'Press any key to continue, or Esc to quit.'
+        if ((Read-MenuKey) -eq 'Escape') { return 'Exit' }
+    }
+    return 'Continue'
 }
 
 function Invoke-UndoRestore($Context, [string]$RunId, [string]$Hash) {
@@ -725,7 +775,7 @@ function Invoke-UndoRestore($Context, [string]$RunId, [string]$Hash) {
     if ($run.RunId -cne $RunId -or $run.Hash -cne $Hash -or (Get-UndoHash $run) -cne $Hash) { throw 'Restore hash does not match this undo run' }
     $expires = Get-UndoExpiry $run
     if ($null -ne $expires -and $expires -le [datetimeoffset]::UtcNow) {
-        Invoke-ExpiredUndoRun $Context $run $manifest
+        [void](Invoke-ExpiredUndoRun $Context $run $manifest)
         throw 'This undo run has expired. Check its named folder in the undo location or Windows Recycle Bin for manual recovery.'
     }
     $restored = 0; $skipped = 0
@@ -1358,7 +1408,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
     do {
         if ($fromMenu) {
             if (-not $expiryChecked) {
-                try { Invoke-ExpiredUndoRuns (New-AgentPurgeContext) } catch { Write-Host "Undo expiry check failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+                if ((Show-ExpiryCheck (New-AgentPurgeContext)) -eq 'Exit') { return }
                 $expiryChecked = $true
             }
             $Arguments = @(Show-StartMenu)
@@ -1385,7 +1435,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
             if ($Arguments.Count -eq 1) {
                 if (-not (Test-InteractiveTerminal)) { throw 'Interactive settings require a terminal; use settings show or settings set.' }
                 if (-not $expiryChecked) {
-                    try { Invoke-ExpiredUndoRuns $settingsContext } catch { Write-Host "Undo expiry check failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+                    if ((Show-ExpiryCheck $settingsContext) -eq 'Exit') { return }
                     $expiryChecked = $true
                 }
                 if ((Show-SettingsMenu $settingsContext) -eq 'Exit') { return }
@@ -1418,7 +1468,7 @@ function Invoke-AgentPurge([string[]]$Arguments) {
             return
         }
         if (-not $expiryChecked) {
-            try { Invoke-ExpiredUndoRuns $context } catch { Write-Host "Undo expiry check failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+            if ((Show-ExpiryCheck $context) -eq 'Exit') { return }
             $expiryChecked = $true
         }
         $session = [pscustomobject]@{ Items = $items; Selected = @{}; Context = $context; Advanced = $advanced; ProjectPath = $project }
