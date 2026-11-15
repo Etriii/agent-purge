@@ -322,6 +322,52 @@ c.close()
         Assert (-not (Test-Path $installRoot)) 'Uninstall files'
         Assert (-not ([Environment]::GetEnvironmentVariable('Path', 'Process') -match [regex]::Escape($installRoot))) 'Uninstall PATH'
     } finally { $script:AgentPurgeScript = $originalSource; [Environment]::SetEnvironmentVariable('Path', $oldPath, 'Process') }
+
+    $migrationBase = Join-Path $fixture 'undo-migration'
+    $migrationCodex = Join-Path $migrationBase 'codex'
+    $migrationClaude = Join-Path $migrationBase 'claude'
+    New-Item -ItemType Directory -Path (Join-Path $migrationClaude 'debug'), $migrationCodex -Force | Out-Null
+    $migrationVersions = Join-Path $migrationBase 'version-area\versions'
+    New-Item -ItemType Directory -Path $migrationVersions -Force | Out-Null
+    $migrationContext = New-AgentPurgeContext -CodexRoot $migrationCodex -ClaudeRoot $migrationClaude -CodexPackages (Join-Path $migrationCodex 'packages') -ClaudeVersions $migrationVersions -ConfigPath (Join-Path $migrationBase 'settings\config.json')
+    $oldFile = Join-Path $migrationClaude 'debug\old.txt'
+    [IO.File]::WriteAllText($oldFile, ('legacy undo data' * 100))
+    $oldItem = New-InventoryItem $migrationContext 'Claude' 'Logs' 'Log' $oldFile '' '' '' '' '' '' $true
+    $oldRuntime = Join-Path $migrationVersions '1.9.0'
+    [IO.File]::WriteAllText($oldRuntime, 'legacy runtime')
+    $oldRuntimeItem = New-InventoryItem $migrationContext 'Claude' 'Runtimes' 'ClaudeRuntime' $oldRuntime '' '' '' '' '' '' $true
+    $oldRun = New-UndoRun @($oldItem, $oldRuntimeItem) $migrationContext
+    foreach ($entry in $oldRun.Entries) { Invoke-UndoMove $entry.Original $entry.Archived }
+    $legacyRoot = Join-Path $migrationBase '.agent-purge-undo'
+    $otherLegacyRoot = Join-Path $migrationBase 'version-area\.agent-purge-undo'
+    $firstUndoLocation = Join-Path $migrationBase 'custom-undo-one'
+    Set-AgentPurgeUndoDirectory $migrationContext $firstUndoLocation | Out-Null
+    Assert (-not (Test-Path $legacyRoot) -and -not (Test-Path $otherLegacyRoot) -and (Test-Path (Join-Path $firstUndoLocation ('runs\' + $oldRun.RunId + '.json')))) 'Changing undo location moves all old roots and manifests'
+    Invoke-UndoRestore $migrationContext $oldRun.RunId $oldRun.Hash | Out-Null
+    Assert ((Get-Content -LiteralPath $oldFile -Raw) -eq ('legacy undo data' * 100) -and (Get-Content -LiteralPath $oldRuntime -Raw) -eq 'legacy runtime') 'Existing restore command works across migrated roots'
+    $newFile = Join-Path $migrationClaude 'debug\new.txt'
+    [IO.File]::WriteAllText($newFile, ('new undo data' * 100))
+    $newItem = New-InventoryItem $migrationContext 'Claude' 'Logs' 'Log' $newFile '' '' '' '' '' '' $true
+    $newRun = New-UndoRun @($newItem) $migrationContext
+    Invoke-UndoMove $newFile $newRun.Entries[0].Archived
+    $secondUndoLocation = Join-Path $migrationBase 'custom-undo-two'
+    Set-AgentPurgeUndoDirectory $migrationContext $secondUndoLocation | Out-Null
+    Assert (-not (Test-Path $firstUndoLocation) -and (Get-AgentPurgeConfig $migrationContext).UndoHistory -contains $firstUndoLocation) 'Moving a configured undo location retains prior path compatibility'
+    Invoke-UndoRestore $migrationContext $newRun.RunId $newRun.Hash | Out-Null
+    Assert ((Get-Content -LiteralPath $newFile -Raw) -eq ('new undo data' * 100)) 'Restore works after a second undo location move'
+    Set-AgentPurgeRetention $migrationContext 22
+    Assert ((Get-AgentPurgeConfig $migrationContext).UndoDirectory -eq $secondUndoLocation) 'Changing retention preserves undo location'
+    $unsafeLocation = Join-Path $migrationClaude 'debug\undo-inside-provider'
+    $rejectedLocation = $false
+    try { Set-AgentPurgeUndoDirectory $migrationContext $unsafeLocation | Out-Null } catch { $rejectedLocation = $true }
+    Assert ($rejectedLocation -and (Get-AgentPurgeConfig $migrationContext).UndoDirectory -eq $secondUndoLocation) 'Undo location cannot overlap provider storage'
+    $conflictLocation = Join-Path $migrationBase 'occupied-undo'
+    New-Item -ItemType Directory -Path $conflictLocation -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $conflictLocation 'unrelated.txt') -Value 'keep'
+    $rejectedLocation = $false
+    try { Set-AgentPurgeUndoDirectory $migrationContext $conflictLocation | Out-Null } catch { $rejectedLocation = $true }
+    Assert ($rejectedLocation -and (Test-Path -LiteralPath $secondUndoLocation) -and (Get-AgentPurgeConfig $migrationContext).UndoDirectory -eq $secondUndoLocation) 'Occupied destination is rejected without changing the active undo folder'
+
     # Drive the real menus with fixture keys and capture their rendered text.
     $script:keys = New-Object 'System.Collections.Generic.Queue[string]'
     $script:screen = New-Object 'System.Collections.Generic.List[string]'
@@ -522,7 +568,36 @@ c.close()
     function Invoke-ExpiredUndoRuns { param($Context) return [pscustomobject]@{ Moved = 1; Skipped = 0 } }
     $script:keys.Enqueue('Enter')
     Assert ((Show-ExpiryCheck $ctx) -eq 'Continue' -and $script:keys.Count -eq 0 -and $script:screen -match 'Undo expiry: 1 folder') 'Expiry result stays visible until acknowledged before the menu redraws'
-    Write-Output 'PASS: fixtures, keyboard cleanup, retention settings, per-volume expiry and retry, legacy undo, restore, command dispatch, install/update/uninstall.'
+    $script:keys.Enqueue('Enter')
+    Invoke-UndoFolderCleanup $migrationContext
+    Assert ((Test-Path $secondUndoLocation) -and $script:keys.Count -eq 0) 'Default undo cleanup choice keeps saved data'
+    $script:undoCleanMethod = ''
+    function Invoke-FileRemoval {
+        param([string]$Path, [string]$Method)
+        $script:undoCleanMethod = $Method
+        if ($Method -eq 'Recycle Bin') { [IO.Directory]::Move($Path, (Join-Path $migrationBase 'recycled-undo')) }
+        else { Remove-Item -LiteralPath $Path -Recurse -Force }
+    }
+    foreach ($key in @('UpArrow', 'UpArrow', 'Enter', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    Invoke-UndoFolderCleanup $migrationContext
+    Assert ($script:undoCleanMethod -eq 'Recycle Bin' -and -not (Test-Path $secondUndoLocation) -and (Test-Path (Join-Path $migrationBase 'recycled-undo\runs'))) 'Confirmed undo cleanup recycles the configured folder and manifests'
+    $permanentFile = Join-Path $migrationClaude 'debug\permanent.txt'
+    Set-Content -LiteralPath $permanentFile -Value 'fixture undo'
+    $permanentItem = New-InventoryItem $migrationContext 'Claude' 'Logs' 'Log' $permanentFile '' '' '' '' '' '' $true
+    $permanentRun = New-UndoRun @($permanentItem) $migrationContext
+    Invoke-UndoMove $permanentFile $permanentRun.Entries[0].Archived
+    $script:undoCleanMethod = ''
+    foreach ($key in @('UpArrow', 'Enter', 'DownArrow', 'Enter', 'DownArrow', 'Enter')) { $script:keys.Enqueue($key) }
+    Invoke-UndoFolderCleanup $migrationContext
+    Assert ($script:undoCleanMethod -eq 'Permanent' -and -not (Test-Path $secondUndoLocation)) 'Permanent undo cleanup requires acknowledgement and final confirmation'
+    $script:undoPathArgument = ''
+    $script:undoCleanRequests = 0
+    function Set-AgentPurgeUndoDirectory { param($Context, [string]$Path) $script:undoPathArgument = $Path }
+    function Invoke-UndoFolderCleanup { param($Context) $script:undoCleanRequests++ }
+    Invoke-AgentPurge @('settings', 'set', 'undo-dir', 'D:\AgentPurgeUndo')
+    Invoke-AgentPurge @('undo', 'clean')
+    Assert ($script:undoPathArgument -eq 'D:\AgentPurgeUndo' -and $script:undoCleanRequests -eq 1) 'Undo location and cleanup commands dispatch to their owners'
+    Write-Output 'PASS: fixtures, keyboard cleanup, undo migration and cleanup, retention settings, expiry and restore, command dispatch, install/update/uninstall.'
 } finally {
     $full = Get-FullPath $fixture
     $tempRoot = Get-FullPath $env:TEMP

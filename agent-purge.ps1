@@ -37,20 +37,38 @@ function New-AgentPurgeContext {
     }
 }
 
-function Get-AgentPurgeConfig($Context) {
+function Get-AgentPurgeConfig($Context, [int]$RetentionOverride = 0) {
+    $previous = $Context.ConfigPath + '.previous'
+    if (-not (Test-Path -LiteralPath $Context.ConfigPath) -and (Test-Path -LiteralPath $previous)) {
+        if (-not (Test-NoReparse $previous)) { throw 'Unsafe previous Agent Purge config' }
+        [IO.File]::Move($previous, $Context.ConfigPath)
+    }
     if (-not (Test-Path -LiteralPath $Context.ConfigPath)) {
-        return [pscustomobject]@{ RetentionDays = 30; Source = 'default' }
+        return [pscustomobject]@{ RetentionDays = $(if ($RetentionOverride) { $RetentionOverride } else { 30 }); UndoDirectory = ''; UndoHistory = @(); Source = 'default' }
     }
     if (-not (Test-NoReparse $Context.ConfigPath)) { throw 'Unsafe Agent Purge config path' }
     $saved = Get-Content -LiteralPath $Context.ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    if ($null -eq $saved.retentionDays -or $saved.retentionDays -isnot [int] -or $saved.retentionDays -lt 1 -or $saved.retentionDays -gt 365) {
+    if (-not $RetentionOverride -and ($null -eq $saved.retentionDays -or $saved.retentionDays -isnot [int] -or $saved.retentionDays -lt 1 -or $saved.retentionDays -gt 365)) {
         throw 'Invalid retentionDays in Agent Purge config; expected an integer from 1 to 365'
     }
-    return [pscustomobject]@{ RetentionDays = [int]$saved.retentionDays; Source = $Context.ConfigPath }
+    $undoDirectory = ''
+    if ($saved.PSObject.Properties['undoDirectory']) {
+        if ($saved.undoDirectory -isnot [string] -or -not [IO.Path]::IsPathRooted($saved.undoDirectory) -or
+            (Get-FullPath $saved.undoDirectory) -cne $saved.undoDirectory) { throw 'Invalid undoDirectory in Agent Purge config' }
+        $undoDirectory = $saved.undoDirectory
+    }
+    $history = @()
+    if ($saved.PSObject.Properties['undoHistory']) {
+        if ($saved.undoHistory -isnot [array]) { throw 'Invalid undoHistory in Agent Purge config' }
+        foreach ($path in $saved.undoHistory) {
+            if ($path -isnot [string] -or -not [IO.Path]::IsPathRooted($path) -or (Get-FullPath $path) -cne $path) { throw 'Invalid undoHistory path in Agent Purge config' }
+            $history += $path
+        }
+    }
+    return [pscustomobject]@{ RetentionDays = $(if ($RetentionOverride) { $RetentionOverride } else { [int]$saved.retentionDays }); UndoDirectory = $undoDirectory; UndoHistory = $history; Source = $Context.ConfigPath }
 }
 
-function Set-AgentPurgeRetention($Context, [int]$Days) {
-    if ($Days -lt 1 -or $Days -gt 365) { throw 'Retention days must be from 1 to 365' }
+function Save-AgentPurgeConfig($Context, $Config) {
     $path = $Context.ConfigPath
     $parent = Split-Path -Parent $path
     if (-not (Test-Path -LiteralPath $parent)) {
@@ -58,7 +76,34 @@ function Set-AgentPurgeRetention($Context, [int]$Days) {
         New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
     }
     if (-not (Test-NoReparse $parent) -or ((Test-Path -LiteralPath $path) -and -not (Test-NoReparse $path))) { throw 'Unsafe Agent Purge config path' }
-    [IO.File]::WriteAllText($path, (@{retentionDays = $Days} | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)
+    $body = [ordered]@{ retentionDays = [int]$Config.RetentionDays }
+    if ($Config.UndoDirectory) { $body['undoDirectory'] = [string]$Config.UndoDirectory }
+    if (@($Config.UndoHistory).Count) { $body['undoHistory'] = @($Config.UndoHistory) }
+    $temporary = Join-Path $parent ('.agent-purge-config-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $backup = $path + '.previous'
+    try {
+        [IO.File]::WriteAllText($temporary, ($body | ConvertTo-Json -Compress -Depth 4), [Text.Encoding]::UTF8)
+        if (Test-Path -LiteralPath $backup) {
+            if (-not (Test-Path -LiteralPath $path) -or -not (Test-NoReparse $backup)) { throw 'Unresolved Agent Purge config backup' }
+            Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $path) { [IO.File]::Move($path, $backup) }
+        try { [IO.File]::Move($temporary, $path) }
+        catch {
+            if (Test-Path -LiteralPath $backup) { [IO.File]::Move($backup, $path) }
+            throw
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+    if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction Stop }
+}
+
+function Set-AgentPurgeRetention($Context, [int]$Days) {
+    if ($Days -lt 1 -or $Days -gt 365) { throw 'Retention days must be from 1 to 365' }
+    $config = Get-AgentPurgeConfig $Context $Days
+    $config.RetentionDays = $Days
+    Save-AgentPurgeConfig $Context $config
 }
 
 function Get-PathSize([string]$Path) {
@@ -562,7 +607,7 @@ function Invoke-FileRemoval([string]$Path, [string]$Method) {
     }
 }
 
-function Get-UndoRootForPath([string]$Path, $Context, [string]$Provider) {
+function Get-LegacyUndoRootForPath([string]$Path, $Context, [string]$Provider) {
     $roots = if ($Provider -eq 'Codex') { @($Context.CodexRoot, $Context.CodexPackages) }
         elseif ($Provider -eq 'Claude') { @($Context.ClaudeRoot, $Context.ClaudeVersions) }
         else { throw 'Unknown undo provider' }
@@ -572,6 +617,40 @@ function Get-UndoRootForPath([string]$Path, $Context, [string]$Provider) {
         }
     }
     throw "Undo path is outside known $Provider storage: $Path"
+}
+
+function Get-UndoRootKey([string]$LegacyRoot) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes((Get-FullPath $LegacyRoot).ToUpperInvariant())
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').Substring(0, 16) }
+    finally { $sha.Dispose() }
+}
+
+function Get-UndoManifestRoot($Context, $Config = $null) {
+    if ($null -eq $Config) { $Config = Get-AgentPurgeConfig $Context }
+    if ($Config.UndoDirectory) { return $Config.UndoDirectory }
+    return (Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo')
+}
+
+function Get-UndoRootForPath([string]$Path, $Context, [string]$Provider, $Config = $null) {
+    $legacyRoot = Get-LegacyUndoRootForPath $Path $Context $Provider
+    if ($null -eq $Config) { $Config = Get-AgentPurgeConfig $Context }
+    if (-not $Config.UndoDirectory) { return $legacyRoot }
+    return (Join-Path (Join-Path $Config.UndoDirectory 'locations') (Get-UndoRootKey $legacyRoot))
+}
+
+function Resolve-UndoEntryPath($Entry, [string]$RunId, $Context, $Config = $null) {
+    if ($null -eq $Config) { $Config = Get-AgentPurgeConfig $Context }
+    $legacyRoot = Get-LegacyUndoRootForPath $Entry.Original $Context $Entry.Provider
+    $key = Get-UndoRootKey $legacyRoot
+    $currentRoot = Get-UndoRootForPath $Entry.Original $Context $Entry.Provider $Config
+    $current = Join-Path (Join-Path (Join-Path $currentRoot 'payload') $RunId) ([string]$Entry.Index)
+    $allowed = @($current, (Join-Path (Join-Path (Join-Path $legacyRoot 'payload') $RunId) ([string]$Entry.Index)))
+    foreach ($prior in @($Config.UndoHistory)) {
+        $allowed += Join-Path (Join-Path (Join-Path (Join-Path (Join-Path $prior 'locations') $key) 'payload') $RunId) ([string]$Entry.Index)
+    }
+    if ($Entry.Archived -cnotin $allowed) { throw 'Undo manifest path mismatch' }
+    return $current
 }
 
 function Initialize-UndoRoot([string]$Root) {
@@ -609,9 +688,10 @@ function Get-UndoHash($Run) {
 function New-UndoRun($Items, $Context) {
     $runId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [guid]::NewGuid().ToString('N')
     $entries = New-Object 'System.Collections.Generic.List[object]'
+    $config = Get-AgentPurgeConfig $Context
     foreach ($item in $Items) {
         foreach ($path in (Get-ItemPaths $item)) {
-            $root = Get-UndoRootForPath $path $Context $item.Provider
+            $root = Get-UndoRootForPath $path $Context $item.Provider $config
             $entries.Add([pscustomobject]@{
                 Index = $entries.Count; Original = (Get-FullPath $path)
                 Archived = (Join-Path (Join-Path (Join-Path $root 'payload') $runId) ([string]$entries.Count))
@@ -620,14 +700,19 @@ function New-UndoRun($Items, $Context) {
         }
     }
     $created = [DateTime]::UtcNow
-    $retention = (Get-AgentPurgeConfig $Context).RetentionDays
+    $retention = $config.RetentionDays
     $run = [pscustomobject]@{
         RunId = $runId; Entries = $entries.ToArray(); Hash = ''
         CreatedAtUtc = $created.ToString('o'); ExpiresAtUtc = $created.AddDays($retention).ToString('o')
     }
     $run.Hash = Get-UndoHash $run
-    $manifestRoot = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
+    $manifestRoot = Get-UndoManifestRoot $Context $config
     foreach ($root in @($manifestRoot) + @($run.Entries | ForEach-Object { Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $_.Archived)) } | Select-Object -Unique)) {
+        $parent = Split-Path -Parent $root
+        if (-not (Test-Path -LiteralPath $parent)) {
+            if (-not (Test-NoReparse (Split-Path -Parent $parent))) { throw 'Unsafe undo location parent' }
+            New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
+        }
         Initialize-UndoRoot $root
     }
     $runs = Join-Path $manifestRoot 'runs'
@@ -635,6 +720,184 @@ function New-UndoRun($Items, $Context) {
     $manifest = Join-Path $runs ($runId + '.json')
     [IO.File]::WriteAllText($manifest, ($run | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
     return $run
+}
+
+function Get-PathFingerprint([string]$Path) {
+    if (-not (Test-NoReparse $Path $true)) { throw "Unsafe or unreadable path: $Path" }
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $records = New-Object 'System.Collections.Generic.List[string]'
+    $entries = @($root)
+    if ($root.PSIsContainer) { $entries += @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop | Sort-Object FullName) }
+    foreach ($entry in $entries) {
+        $relative = $entry.FullName.Substring($root.FullName.Length).TrimStart([char]'\', [char]'/')
+        if ($entry.PSIsContainer) { $records.Add("D|$relative") }
+        else { $records.Add("F|$relative|$($entry.Length)|$((Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash)") }
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($records -join "`n"))))).Replace('-', '') }
+    finally { $sha.Dispose() }
+}
+
+function Get-LegacyUndoRoots($Context) {
+    return @(@($Context.CodexRoot, $Context.ClaudeRoot, $Context.CodexPackages, $Context.ClaudeVersions) |
+        ForEach-Object { Join-Path (Split-Path -Parent $_) '.agent-purge-undo' } | Sort-Object -Unique)
+}
+
+function Copy-VerifiedPath([string]$Source, [string]$Destination) {
+    if (-not (Test-NoReparse $Source $true) -or -not (Test-NoReparse (Split-Path -Parent $Destination)) -or (Test-Path -LiteralPath $Destination)) {
+        throw 'Unsafe, missing, or occupied copy path'
+    }
+    $item = Get-Item -LiteralPath $Source -Force -ErrorAction Stop
+    $sourceHash = Get-PathFingerprint $Source
+    $staging = $Destination + '.copy-' + [guid]::NewGuid().ToString('N')
+    try {
+        if ($item.PSIsContainer) { Copy-Item -LiteralPath $Source -Destination $staging -Recurse -Force -ErrorAction Stop }
+        else { [IO.File]::Copy($Source, $staging) }
+        if ((Get-PathFingerprint $staging) -cne $sourceHash -or (Get-PathFingerprint $Source) -cne $sourceHash) {
+            throw 'Copied data differs from the source; original kept'
+        }
+        if ($item.PSIsContainer) { [IO.Directory]::Move($staging, $Destination) }
+        else { [IO.File]::Move($staging, $Destination) }
+    } finally {
+        if (Test-Path -LiteralPath $staging) {
+            if (-not (Test-Within $staging (Split-Path -Parent $Destination))) { throw 'Unsafe copy staging path' }
+            Remove-Item -LiteralPath $staging -Force -Recurse -ErrorAction Stop
+        }
+    }
+}
+
+function Copy-VerifiedUndoContents([string]$SourceRoot, [string]$TargetRoot) {
+    Initialize-UndoRoot $SourceRoot
+    Initialize-UndoRoot $TargetRoot
+    if (-not (Test-NoReparse $SourceRoot $true)) { throw "Unsafe undo source: $SourceRoot" }
+    $before = Get-PathFingerprint $SourceRoot
+    foreach ($child in (Get-ChildItem -LiteralPath $SourceRoot -Force -ErrorAction Stop)) {
+        if ($child.Name -eq 'agent-purge-undo-v1.marker') { continue }
+        $destination = Join-Path $TargetRoot $child.Name
+        if (-not (Test-Path -LiteralPath $destination)) { Copy-VerifiedPath $child.FullName $destination }
+        if ((Get-PathFingerprint $child.FullName) -cne (Get-PathFingerprint $destination)) {
+            throw "Undo copy differs from source: $($child.FullName)"
+        }
+    }
+    if ((Get-PathFingerprint $SourceRoot) -cne $before) { throw "Undo source changed during copy: $SourceRoot" }
+    return $before
+}
+
+function Set-AgentPurgeUndoDirectory($Context, [string]$Path) {
+    if (-not [IO.Path]::IsPathRooted($Path)) { throw 'Undo directory must be an absolute path' }
+    $target = Get-FullPath $Path
+    if ($target -eq [IO.Path]::GetPathRoot($target)) { throw 'Choose a folder, not a drive root' }
+    $config = Get-AgentPurgeConfig $Context
+    if ($config.UndoDirectory -and $target -ieq $config.UndoDirectory) { Write-Host "Undo folder already set to $target"; return }
+    $sources = if ($config.UndoDirectory) { @($config.UndoDirectory) } else { @(Get-LegacyUndoRoots $Context | Where-Object { Test-Path -LiteralPath $_ }) }
+    foreach ($unsafe in @($Context.CodexRoot, $Context.ClaudeRoot, $Context.CodexPackages, $Context.ClaudeVersions, $Context.ConfigPath) + @(Get-LegacyUndoRoots $Context) + $sources) {
+        if ((Test-Within $target $unsafe) -or (Test-Within $unsafe $target)) { throw "Undo directory overlaps protected or existing storage: $unsafe" }
+    }
+    $ancestor = $target
+    while (-not (Test-Path -LiteralPath $ancestor)) { $ancestor = Split-Path -Parent $ancestor }
+    if (-not (Test-NoReparse $ancestor)) { throw 'Unsafe undo directory parent' }
+    if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force -ErrorAction Stop | Out-Null }
+    if (-not (Test-NoReparse $target)) { throw 'Unsafe undo directory' }
+    $marker = Join-Path $target 'agent-purge-undo-v1.marker'
+    if (-not (Test-Path -LiteralPath $marker) -and -not @(Get-ChildItem -LiteralPath $target -Force -ErrorAction Stop).Count) {
+        [IO.File]::WriteAllText($marker, 'agent-purge-undo-v1', [Text.Encoding]::ASCII)
+    }
+    Initialize-UndoRoot $target
+    $migrationMarker = Join-Path $target '.agent-purge-migration-source'
+    $sourceIdentity = (@($sources | Sort-Object) -join "`n")
+    if (Test-Path -LiteralPath $migrationMarker) {
+        if (-not (Test-NoReparse $migrationMarker) -or (Get-Content -LiteralPath $migrationMarker -Raw -ErrorAction Stop) -cne $sourceIdentity) {
+            throw 'Undo destination belongs to another migration'
+        }
+    } else {
+        if (@(Get-ChildItem -LiteralPath $target -Force -ErrorAction Stop | Where-Object Name -ne 'agent-purge-undo-v1.marker').Count) {
+            throw 'Undo destination already contains data; choose an empty folder'
+        }
+        [IO.File]::WriteAllText($migrationMarker, $sourceIdentity, [Text.Encoding]::UTF8)
+    }
+    $snapshots = @{}
+    if ($config.UndoDirectory) {
+        $snapshots[$config.UndoDirectory] = Copy-VerifiedUndoContents $config.UndoDirectory $target
+    } else {
+        foreach ($source in $sources) {
+            $location = Join-Path (Join-Path $target 'locations') (Get-UndoRootKey $source)
+            New-Item -ItemType Directory -Path (Split-Path -Parent $location) -Force -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath $location)) { New-Item -ItemType Directory -Path $location -ErrorAction Stop | Out-Null }
+            if (-not (Test-NoReparse $location)) { throw 'Unsafe undo destination location' }
+            $locationMarker = Join-Path $location 'agent-purge-undo-v1.marker'
+            if (-not (Test-Path -LiteralPath $locationMarker) -and -not @(Get-ChildItem -LiteralPath $location -Force -ErrorAction Stop).Count) {
+                [IO.File]::WriteAllText($locationMarker, 'agent-purge-undo-v1', [Text.Encoding]::ASCII)
+            }
+            $snapshots[$source] = Copy-VerifiedUndoContents $source $location
+        }
+        $manifestSource = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
+        $oldRuns = Join-Path $manifestSource 'runs'
+        if (Test-Path -LiteralPath $oldRuns) {
+            $newRuns = Join-Path $target 'runs'
+            if (-not (Test-Path -LiteralPath $newRuns)) { Copy-VerifiedPath $oldRuns $newRuns }
+            if ((Get-PathFingerprint $oldRuns) -cne (Get-PathFingerprint $newRuns)) { throw 'Undo manifest copy differs from source' }
+        }
+    }
+    if ($config.UndoDirectory) { $config.UndoHistory = @($config.UndoHistory) + @($config.UndoDirectory) }
+    $config.UndoDirectory = $target
+    Save-AgentPurgeConfig $Context $config
+    foreach ($source in $sources) {
+        if ((Test-Path -LiteralPath $source) -and (Get-PathFingerprint $source) -ceq $snapshots[$source]) {
+            if (-not (Test-NoReparse $source $true)) { throw "Unsafe old undo folder: $source" }
+            Remove-Item -LiteralPath $source -Recurse -Force -ErrorAction Stop
+        } elseif (Test-Path -LiteralPath $source) {
+            Write-Host "Old undo folder changed during migration; inspect and remove it manually: $source" -ForegroundColor Yellow
+        }
+    }
+    if (Test-Path -LiteralPath $migrationMarker) { Remove-Item -LiteralPath $migrationMarker -Force -ErrorAction Stop }
+    Write-Host "Undo folder set to $target. Existing undo data was verified at the new location."
+}
+
+function Invoke-UndoFolderCleanup($Context) {
+    if (-not (Test-InteractiveTerminal)) { throw 'Undo cleanup requires an interactive terminal' }
+    $config = Get-AgentPurgeConfig $Context
+    $roots = if ($config.UndoDirectory) { @($config.UndoDirectory) } else { @(Get-LegacyUndoRoots $Context) }
+    $items = @($roots | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object {
+        Initialize-UndoRoot $_
+        if (-not (Test-NoReparse $_ $true)) { throw "Unsafe undo folder: $_" }
+        $size = Get-PathSize $_
+        [pscustomobject]@{ Path = $_; Kind = 'UndoRoot'; Key = $_; Bytes = $size.Bytes; Incomplete = $size.Incomplete; Eligible = $true }
+    })
+    if (-not $items.Count) { Write-Host 'No undo folder exists at the current location.'; return }
+    $snapshots = @{}
+    foreach ($item in $items) { $snapshots[$item.Path] = Get-PathFingerprint $item.Path }
+    $choice = Read-CleanupChoice 'CLEAN UNDO FOLDER' $items @('Move undo data to Recycle Bin', 'Delete undo data permanently', 'Keep undo data') 2 'This removes all saved undo runs. Restore commands will stop working.'
+    if ($choice -in @('Exit', 'Back', 'Keep undo data')) { return }
+    if ($choice -eq 'Delete undo data permanently') {
+        $warning = Read-CleanupChoice 'PERMANENT UNDO WARNING' $items @('Keep undo data', 'I understand no undo runs can be restored') 0 'Permanent deletion cannot be reversed.'
+        if ($warning -ne 'I understand no undo runs can be restored') { return }
+    }
+    $action = if ($choice -eq 'Move undo data to Recycle Bin') { 'Move undo folders to Recycle Bin' } else { 'Delete undo folders permanently' }
+    $confirm = Read-CleanupChoice 'CONFIRM UNDO CLEANUP' $items @('Keep undo data', $action) 0 'The listed undo folders and manifests will be removed.'
+    if ($confirm -ne $action) { return }
+    $method = if ($choice -eq 'Move undo data to Recycle Bin') { 'Recycle Bin' } else { 'Permanent' }
+    foreach ($item in $items) {
+        try {
+            Initialize-UndoRoot $item.Path
+            if ((Get-PathFingerprint $item.Path) -cne $snapshots[$item.Path]) { throw 'Undo folder changed after confirmation' }
+            Invoke-FileRemoval $item.Path $method
+            Write-Host "OK $method $($item.Path)"
+        } catch { Write-Host "FAIL $($item.Path): $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+}
+
+function Move-VerifiedPath([string]$Source, [string]$Destination) {
+    if (-not (Test-NoReparse $Source $true) -or -not (Test-NoReparse (Split-Path -Parent $Destination)) -or (Test-Path -LiteralPath $Destination)) {
+        throw 'Unsafe, missing, or occupied move path'
+    }
+    $item = Get-Item -LiteralPath $Source -Force -ErrorAction Stop
+    if ([IO.Path]::GetPathRoot($Source) -eq [IO.Path]::GetPathRoot($Destination)) {
+        if ($item.PSIsContainer) { [IO.Directory]::Move($Source, $Destination) }
+        else { [IO.File]::Move($Source, $Destination) }
+        return
+    }
+    Copy-VerifiedPath $Source $Destination
+    Remove-Item -LiteralPath $Source -Force -Recurse -ErrorAction Stop
 }
 
 function Invoke-UndoMove([string]$Original, [string]$Archived) {
@@ -645,10 +908,7 @@ function Invoke-UndoMove([string]$Original, [string]$Archived) {
         ((Test-Path -LiteralPath $parent) -and -not (Test-NoReparse $parent))) { throw 'Unsafe undo destination' }
     New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
     if (-not (Test-NoReparse $parent) -or (Test-Path -LiteralPath $Archived)) { throw 'Unsafe or occupied undo destination' }
-    if ([IO.Path]::GetPathRoot($Original) -ne [IO.Path]::GetPathRoot($Archived)) { throw 'Undo folder must be on the source volume' }
-    $entry = Get-Item -LiteralPath $Original -Force -ErrorAction Stop
-    if ($entry.PSIsContainer) { [IO.Directory]::Move($Original, $Archived) }
-    else { [IO.File]::Move($Original, $Archived) }
+    Move-VerifiedPath $Original $Archived
 }
 
 function Invoke-UndoCompress([string]$Archived) {
@@ -676,10 +936,10 @@ function Invoke-ExpiredUndoRun($Context, $Run, [string]$ManifestPath, [datetimeo
     $moved = 0; $skipped = 0
     $name = 'agent-purge-' + $Run.RunId + '-' + $Run.Hash.Substring(0, 12)
     $roots = @{}
+    $config = Get-AgentPurgeConfig $Context
     foreach ($entry in $Run.Entries) {
-        $root = Get-UndoRootForPath $entry.Original $Context $entry.Provider
-        $expected = Join-Path (Join-Path (Join-Path $root 'payload') $Run.RunId) ([string]$entry.Index)
-        if ($entry.Archived -cne $expected) { throw 'Undo manifest path mismatch' }
+        $root = Get-UndoRootForPath $entry.Original $Context $entry.Provider $config
+        [void](Resolve-UndoEntryPath $entry $Run.RunId $Context $config)
         $roots[$root] = $true
     }
     $byVolume = @{}
@@ -728,7 +988,7 @@ function Invoke-ExpiredUndoRun($Context, $Run, [string]$ManifestPath, [datetimeo
                 if (-not (Test-NoReparse $from $true)) { throw "Unsafe undo folder contents at $root" }
                 $children = @(Get-ChildItem -LiteralPath $from -Force -ErrorAction Stop)
                 if (-not $children.Count) { continue }
-                $expectedNames = @($Run.Entries | Where-Object { (Split-Path -Parent $_.Archived) -eq $source } | ForEach-Object { Split-Path -Leaf $_.Archived })
+                $expectedNames = @($Run.Entries | Where-Object { (Split-Path -Parent (Resolve-UndoEntryPath $_ $Run.RunId $Context $config)) -eq $source } | ForEach-Object { [string]$_.Index })
                 foreach ($child in $children) {
                     if ($child.Name -notin $expectedNames -and $child.Name -ne 'agent-purge-manifest.json') { throw "Unexpected undo folder entry: $($child.Name)" }
                 }
@@ -751,7 +1011,7 @@ function Invoke-ExpiredUndoRun($Context, $Run, [string]$ManifestPath, [datetimeo
 
 function Invoke-ExpiredUndoRuns($Context, [datetimeoffset]$Now = [datetimeoffset]::UtcNow) {
     $moved = 0; $skipped = 0
-    $root = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
+    $root = Get-UndoManifestRoot $Context
     if (-not (Test-Path -LiteralPath $root)) { return [pscustomobject]@{ Moved = 0; Skipped = 0 } }
     Initialize-UndoRoot $root
     $runs = Join-Path $root 'runs'
@@ -782,7 +1042,8 @@ function Show-ExpiryCheck($Context) {
 
 function Invoke-UndoRestore($Context, [string]$RunId, [string]$Hash) {
     if ($RunId -cnotmatch '^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}$' -or $Hash -cnotmatch '^[0-9A-F]{64}$') { throw 'Invalid run ID or restore hash format' }
-    $root = Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo'
+    $config = Get-AgentPurgeConfig $Context
+    $root = Get-UndoManifestRoot $Context $config
     if (-not (Test-Path -LiteralPath $root)) { throw 'Undo folder not found' }
     Initialize-UndoRoot $root
     $manifest = Join-Path (Join-Path $root 'runs') ($RunId + '.json')
@@ -797,17 +1058,14 @@ function Invoke-UndoRestore($Context, [string]$RunId, [string]$Hash) {
     $restored = 0; $skipped = 0
     foreach ($entry in $run.Entries) {
         try {
-            $archiveRoot = Get-UndoRootForPath $entry.Original $Context $entry.Provider
-            $expected = Join-Path (Join-Path (Join-Path $archiveRoot 'payload') $RunId) ([string]$entry.Index)
-            if ($entry.Archived -cne $expected) { throw 'Undo manifest path mismatch' }
+            $archiveRoot = Get-UndoRootForPath $entry.Original $Context $entry.Provider $config
+            $archivedPath = Resolve-UndoEntryPath $entry $RunId $Context $config
             Initialize-UndoRoot $archiveRoot
-            if (-not (Test-Path -LiteralPath $entry.Archived)) { $skipped++; Write-Host "SKIP not archived: $($entry.Original)"; continue }
+            if (-not (Test-Path -LiteralPath $archivedPath)) { $skipped++; Write-Host "SKIP not archived: $($entry.Original)"; continue }
             if (Test-Path -LiteralPath $entry.Original) { throw 'Original path already exists; no overwrite' }
             if (-not (Test-AppClosed $entry.Provider)) { throw "Close $($entry.Provider) before restore" }
-            if (-not (Test-NoReparse $entry.Archived $true) -or -not (Test-NoReparse (Split-Path -Parent $entry.Original))) { throw 'Reparse point, missing parent, or unreadable path' }
-            $archived = Get-Item -LiteralPath $entry.Archived -Force -ErrorAction Stop
-            if ($archived.PSIsContainer) { [IO.Directory]::Move($entry.Archived, $entry.Original) }
-            else { [IO.File]::Move($entry.Archived, $entry.Original) }
+            if (-not (Test-NoReparse $archivedPath $true) -or -not (Test-NoReparse (Split-Path -Parent $entry.Original))) { throw 'Reparse point, missing parent, or unreadable path' }
+            Move-VerifiedPath $archivedPath $entry.Original
             $restored++; Write-Host "RESTORED $($entry.Original)"
         } catch { $skipped++; Write-Host "SKIP $($entry.Original): $($_.Exception.Message)" }
     }
@@ -969,7 +1227,7 @@ function Invoke-Cleanup($Items, $Context, [bool]$Advanced = $false) {
             Write-Host "Undo folder: $root"
             Write-Host ("This run's stored files: {0}" -f (Join-Path (Join-Path $root 'payload') $undoRun.RunId))
         }
-        Write-Host ("Undo manifest: {0}" -f (Join-Path (Join-Path (Split-Path -Parent $Context.CodexRoot) '.agent-purge-undo\runs') ($undoRun.RunId + '.json')))
+        Write-Host ("Undo manifest: {0}" -f (Join-Path (Join-Path (Get-UndoManifestRoot $Context) 'runs') ($undoRun.RunId + '.json')))
         Write-Host 'Undo files still use disk space; NTFS compression may reduce it. Codex deletions are not part of this restore.'
     }
     $after = Get-FreeSpace $selected
@@ -1375,6 +1633,9 @@ Usage:
   agent-purge settings show         Print the current retention setting
   agent-purge settings set retention-days <1-365>
                                     Set retention for future undo runs
+  agent-purge settings set undo-dir <absolute-path>
+                                    Move existing undo data and store new runs there
+  agent-purge undo clean            Review Recycle Bin or permanent undo cleanup
   agent-purge install               Install a user-local launcher and PATH entry
   agent-purge update                Install the latest published main script
   agent-purge uninstall             Remove installed files and that PATH entry
@@ -1393,7 +1654,7 @@ Permanent deletion requires an acknowledgement and a final confirmation; Cancel 
 Sizes show inventoried agent storage by project/provider/category, not source folders.
 Clean --all never removes protected items and still requires an explicit keyboard confirmation.
 Redirected scan and clean commands only print inventory; they never remove data.
-Installed interactive launches offer an update from GitHub main when available.
+Interactive launches stay local; use agent-purge update to check GitHub main.
 Update refreshes the installed copy; to update a source checkout, pull main.
 '@ | Write-Output
 }
@@ -1406,8 +1667,10 @@ function Show-SettingsMenu($Context) {
         Write-ScreenLine 'AGENT PURGE / SETTINGS' Cyan
         Write-ScreenLine ('Undo retention: {0} days' -f $days)
         Write-ScreenLine ('Saved setting: {0} days ({1})' -f $saved.RetentionDays, $saved.Source) DarkGray
+        Write-ScreenLine ('Undo location: ' + $(if ($saved.UndoDirectory) { $saved.UndoDirectory } else { Get-UndoManifestRoot $Context $saved })) Cyan
         Write-ScreenLine 'This value applies only to new undo runs; existing run deadlines stay fixed.'
         Write-ScreenLine 'Up/Right +1 | Down/Left -1 | PgUp/PgDn +/-10 | Home 30'
+        Write-ScreenLine 'U move undo folder to another location | C clean undo folder'
         Write-ScreenLine 'Enter/Space save | B/Backspace back | Esc/Ctrl+C twice quit'
         $key = Read-MenuKey
         switch ($key) {
@@ -1418,6 +1681,20 @@ function Show-SettingsMenu($Context) {
             'PageUp' { $days = [math]::Min(365, $days + 10) }
             'PageDown' { $days = [math]::Max(1, $days - 10) }
             'Home' { $days = 30 }
+            'U' {
+                $path = (Read-Host 'New undo folder (absolute path; blank cancels)').Trim().Trim('"')
+                if ($path) {
+                    try { Set-AgentPurgeUndoDirectory $Context $path; $saved = Get-AgentPurgeConfig $Context }
+                    catch { Write-Host "Undo location unchanged: $($_.Exception.Message)" -ForegroundColor Yellow }
+                    Write-Host 'Press any key to return to settings.'
+                    [void](Read-MenuKey)
+                }
+            }
+            'C' {
+                Invoke-UndoFolderCleanup $Context
+                Write-Host 'Press any key to return to settings.'
+                [void](Read-MenuKey)
+            }
             { $_ -in @('Enter', 'Spacebar') } {
                 Set-AgentPurgeRetention $Context $days
                 Write-Host "Retention saved: $days days for new undo runs."
@@ -1434,7 +1711,7 @@ function Show-StartMenu {
         'Browse providers and categories to understand storage and protected items.',
         'Preselect eligible sessions and logs. You can deselect before confirming cleanup.',
         'Limit session history to a project folder and its descendants.',
-        'View or change undo retention for future cleanup runs.',
+        'Set undo retention and storage location, or clean saved undo data.',
         'Close Agent Purge without making further changes.'
     )
     $index = 0
@@ -1499,11 +1776,20 @@ function Invoke-AgentPurge([string[]]$Arguments) {
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'install') { Install-AgentPurge; return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'update') { [void](Update-AgentPurge); return }
         if ($Arguments.Count -eq 1 -and $Arguments[0] -eq 'uninstall') { Uninstall-AgentPurge; return }
+        if ($Arguments.Count -eq 2 -and $Arguments[0] -eq 'undo' -and $Arguments[1] -eq 'clean') {
+            Invoke-UndoFolderCleanup (New-AgentPurgeContext)
+            return
+        }
         if ($Arguments[0] -eq 'settings') {
             $settingsContext = New-AgentPurgeContext
             if ($Arguments.Count -eq 2 -and $Arguments[1] -eq 'show') {
                 $saved = Get-AgentPurgeConfig $settingsContext
                 Write-Output ("Undo retention: $($saved.RetentionDays) days ($($saved.Source)); future runs only.")
+                Write-Output ("Undo location: $(Get-UndoManifestRoot $settingsContext $saved)")
+                return
+            }
+            if ($Arguments.Count -eq 4 -and $Arguments[1] -eq 'set' -and $Arguments[2] -eq 'undo-dir') {
+                Set-AgentPurgeUndoDirectory $settingsContext $Arguments[3]
                 return
             }
             if ($Arguments.Count -eq 4 -and $Arguments[1] -eq 'set' -and $Arguments[2] -eq 'retention-days') {
